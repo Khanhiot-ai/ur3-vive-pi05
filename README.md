@@ -12,7 +12,7 @@ Hệ thống điều khiển UR3 bằng HTC Vive Tracker, thu data demo cho fine
 2. [Phần Cứng](#2-phần-cứng)
 3. [Phần Mềm](#3-phần-mềm)
 4. [Cấu Trúc Dự Án](#4-cấu-trúc-dự-án)
-5. [Tạo ROS2 Package Từ Đầu](#5-tạo-ros2-package-từ-đầu)
+5. [(Tham khảo) Tạo ROS2 Package Từ Đầu](#5-tham-khảo-tạo-ros2-package-từ-đầu)
 6. [Cài Đặt và Build](#6-cài-đặt-và-build)
 7. [Setup Phần Cứng](#7-setup-phần-cứng)
 8. [Calibration](#8-calibration)
@@ -188,7 +188,10 @@ float64 yaw
 
 ---
 
-## 5. Tạo ROS2 Package Từ Đầu
+## 5. (Tham khảo) Tạo ROS2 Package Từ Đầu
+
+> ⚠️ **Chương này CHỈ DÀNH cho người muốn dựng workspace từ scratch.**
+> Nếu bạn chỉ clone repo về dùng → **BỎ QUA chương này, đi tiếp chương 6**.
 
 Nếu dựng lại workspace trên máy mới:
 
