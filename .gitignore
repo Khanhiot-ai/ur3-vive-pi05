@@ -1,0 +1,28 @@
+# Build artifacts
+build/
+install/
+log/
+__pycache__/
+*.pyc
+*.pyo
+
+# ROS log (file 1.4GB)
+ur_log/
+*.log
+
+# Dataset
+dataset/
+*.hdf5
+*.mp4
+pid_log.csv
+
+# VS Code (browse.vc.db nặng)
+.vscode/
+*.vc.db
+browse.vc.db
+
+# Editor
+.idea/
+
+# OS
+.DS_Store

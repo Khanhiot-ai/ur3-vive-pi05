@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Dataset (file lớn, không push)
+dataset/
+*.mp4
+*.jpg
+*.png
+
+# Build artifacts
+build/
+install/
+log/
+
+# IDE
+.vscode/
+.idea/
+ur_log/
+*.log
