@@ -19,7 +19,6 @@ Hệ thống điều khiển UR3 bằng HTC Vive Tracker, thu data demo cho fine
 9. [Workflow Thu Data](#9-workflow-thu-data)
 10. [Format Dataset HDF5](#10-format-dataset-hdf5)
 11. [Convert sang LeRobot](#11-convert-sang-lerobot)
-12. [Push Lên GitHub](#12-push-lên-github)
 13. [Troubleshooting](#13-troubleshooting)
 
 ---
@@ -656,110 +655,7 @@ LeRobotDataset('khanh/ur3_pick_cube').push_to_hub()
 
 ---
 
-## 12. Push Lên GitHub
 
-### 12.1 Setup lần đầu
-
-```bash
-sudo apt install git
-git config --global user.name "Khanh"
-git config --global user.email "your_email@gmail.com"
-git config --global credential.helper store
-```
-
-### 12.2 Personal Access Token
-
-1. Vào https://github.com/settings/tokens/new
-2. Note: `ur3-vive-pi05`
-3. Expiration: 90 days
-4. Tick scope **`repo`**
-5. Generate → COPY token (chỉ hiện 1 lần!)
-
-### 12.3 Tạo .gitignore (RẤT QUAN TRỌNG)
-
-```bash
-cd ~/ur5_teleop_vive
-
-cat > .gitignore << 'EOF'
-# Build artifacts
-build/
-install/
-log/
-__pycache__/
-*.pyc
-*.pyo
-
-# ROS log
-ur_log/
-*.log
-
-# Dataset (file lớn)
-dataset/
-*.hdf5
-*.mp4
-pid_log.csv
-
-# Editor
-.vscode/
-.idea/
-
-# OS
-.DS_Store
-EOF
-```
-
-### 12.4 Push lần đầu
-
-```bash
-cd ~/ur5_teleop_vive
-
-git init
-git add .
-
-# Check trước khi commit
-git status
-find . -type f -size +50M -not -path "./.git/*"
-
-git commit -m "Initial commit: UR3 teleop Vive + Pi0.5"
-git remote add origin https://github.com/Khanhiot-ai/ur3-vive-pi05.git
-git branch -M main
-git push -u origin main
-```
-
-Password → **paste token**.
-
-### 12.5 Nếu file lớn bị reject
-
-```bash
-git filter-branch --force --index-filter \
-  "git rm -r --cached --ignore-unmatch path/to/big_file" \
-  --prune-empty --tag-name-filter cat -- --all
-
-git push --force
-```
-
-### 12.6 File mesh
-
-`hand.dae` nhẹ → push bình thường. Nếu mesh > 100MB → Git LFS:
-
-```bash
-sudo apt install git-lfs
-git lfs install
-git lfs track "*.dae"
-git lfs track "*.stl"
-git add .gitattributes
-git push
-```
-
-### 12.7 Lần sau
-
-```bash
-git add .
-git commit -m "Mô tả thay đổi"
-git push
-```
-
----
 
 ## 13. Troubleshooting
 
