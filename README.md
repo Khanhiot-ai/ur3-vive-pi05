@@ -19,7 +19,7 @@ Hệ thống điều khiển UR3 bằng HTC Vive Tracker, thu data demo cho fine
 9. [Workflow Thu Data](#9-workflow-thu-data)
 10. [Format Dataset HDF5](#10-format-dataset-hdf5)
 11. [Convert sang LeRobot](#11-convert-sang-lerobot)
-13. [Troubleshooting](#13-troubleshooting)
+12. [Troubleshooting](#12-troubleshooting)
 
 ---
 
@@ -440,10 +440,99 @@ ls /sys/bus/usb/devices/ | xargs -I{} sh -c \
   'echo -n "{}: "; cat /sys/bus/usb/devices/{}/speed 2>/dev/null'
 ```
 
-### 7.4 Test SteamVR
+### 7.4 SteamVR — Chạy KHÔNG cần Headset
 
-- Mở SteamVR
-- Tracker xanh + 2 lighthouse xanh
+Dự án này dùng Vive Tracker mà **KHÔNG cắm headset**, nên SteamVR phải được cấu hình để bỏ qua yêu cầu headset.
+
+**Phải sửa 2 file config của SteamVR.**
+
+#### Tìm Steam directory
+
+Trên Ubuntu, Steam directory thường ở:
+```bash
+# Cài qua website Steam
+~/.local/share/Steam/
+
+# Cài qua apt (package manager)
+~/.steam/
+
+# Verify
+ls ~/.local/share/Steam/steamapps/common/SteamVR/ 2>/dev/null &&   STEAM_DIR=~/.local/share/Steam ||   STEAM_DIR=~/.steam
+echo "Steam dir: $STEAM_DIR"
+```
+
+#### File 1: Bật Null Driver
+
+Mở file:
+```bash
+nano ~/.local/share/Steam/steamapps/common/SteamVR/drivers/null/resources/settings/default.vrsettings
+```
+
+Tìm dòng:
+```json
+"enable": false,
+```
+
+Đổi thành:
+```json
+"enable": true,
+```
+
+#### File 2: Tắt yêu cầu HMD
+
+Mở file:
+```bash
+nano ~/.local/share/Steam/steamapps/common/SteamVR/resources/settings/default.vrsettings
+```
+
+Sửa 3 dòng:
+```json
+"requireHmd": false,              ← từ true
+"forcedDriver": "null",           ← từ ""
+"activateMultipleDrivers": true,  ← từ false
+```
+
+#### Verify
+
+Khởi động lại SteamVR:
+```bash
+# Đóng SteamVR nếu đang chạy, rồi mở lại
+steam steam://launch/250820
+```
+
+SteamVR sẽ hiện cửa sổ status với:
+- ✅ Không báo lỗi "headset not detected"
+- ✅ Tracker hiện xanh (đèn xanh trên tracker, icon xanh trong SteamVR)
+- ✅ 2 lighthouse hiện xanh
+
+#### ⚠️ Lưu ý quan trọng
+
+**SteamVR sẽ tự ghi đè 2 file này khi update.** Để giữ vĩnh viễn, copy các settings vào file user:
+
+```bash
+# Tìm file user (có thể không tồn tại, tạo nếu chưa có)
+USER_CONFIG=~/.local/share/Steam/config/steamvr.vrsettings
+
+# Nếu không có, tạo file với nội dung:
+cat > $USER_CONFIG << 'JSON'
+{
+   "steamvr" : {
+      "requireHmd" : false,
+      "forcedDriver" : "null",
+      "activateMultipleDrivers" : true
+   },
+   "driver_null" : {
+      "enable" : true
+   }
+}
+JSON
+```
+
+File user **không bị SteamVR ghi đè khi update**.
+
+#### Reference
+
+Hướng dẫn gốc: https://github.com/username223/SteamVRNoHeadset
 
 ---
 
@@ -655,9 +744,7 @@ LeRobotDataset('khanh/ur3_pick_cube').push_to_hub()
 
 ---
 
-
-
-## 13. Troubleshooting
+## 12. Troubleshooting
 
 ### Camera không hiện
 - `v4l2-ctl --list-devices` để tìm device mới
