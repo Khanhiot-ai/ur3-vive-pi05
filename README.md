@@ -1,25 +1,28 @@
 # UR3 Vive Teleop + Pi0.5 Dataset System
 
-Hệ thống điều khiển UR3 bằng HTC Vive Tracker, thu data demo cho fine-tune **Pi0.5** (Vision-Language-Action model).
+Hệ thống điều khiển **UR3** bằng **HTC Vive Tracker** + gripper **Robstride**, thu data đa-modal HDF5 để fine-tune **Pi0.5 VLA** cho task pick & place.
 
 🔗 **Repo**: https://github.com/Khanhiot-ai/ur3-vive-pi05
+📦 **Dataset**: https://huggingface.co/datasets/qkhanh1/ur3_pick_cube
 
 ---
 
 ## 📋 Mục Lục
 
 1. [Tổng Quan](#1-tổng-quan)
-2. [Phần Cứng](#2-phần-cứng)
-3. [Phần Mềm](#3-phần-mềm)
-4. [Cấu Trúc Dự Án](#4-cấu-trúc-dự-án)
-5. [(Tham khảo) Tạo ROS2 Package Từ Đầu](#5-tham-khảo-tạo-ros2-package-từ-đầu)
+2. [Changelog — Các Fix Đã Làm](#2-changelog--các-fix-đã-làm)
+3. [Phần Cứng](#3-phần-cứng)
+4. [Phần Mềm](#4-phần-mềm)
+5. [Cấu Trúc Dự Án](#5-cấu-trúc-dự-án)
 6. [Cài Đặt và Build](#6-cài-đặt-và-build)
 7. [Setup Phần Cứng](#7-setup-phần-cứng)
-8. [Calibration](#8-calibration)
+8. [Calibration (góc yaw)](#8-calibration-góc-yaw)
 9. [Workflow Thu Data](#9-workflow-thu-data)
-10. [Format Dataset HDF5](#10-format-dataset-hdf5)
-11. [Convert sang LeRobot](#11-convert-sang-lerobot)
-12. [Troubleshooting](#12-troubleshooting)
+10. [Check Dataset HDF5](#10-check-dataset-hdf5)
+11. [Format Dataset HDF5](#11-format-dataset-hdf5)
+12. [Convert + Push HuggingFace](#12-convert--push-huggingface)
+13. [Inference Pi0.5 trên Robot](#13-inference-pi05-trên-robot)
+14. [Troubleshooting](#14-troubleshooting)
 
 ---
 
@@ -27,367 +30,338 @@ Hệ thống điều khiển UR3 bằng HTC Vive Tracker, thu data demo cho fine
 
 ### Mục tiêu
 
-Thu thập dữ liệu demonstration cho UR3 thực hiện task gắp vật, để fine-tune Pi0.5.
+Thu dataset demonstration để fine-tune **Pi0.5 VLA** cho task gắp vật trên UR3.
 
-### Cách hoạt động
+### Pipeline tổng
 
 ```
-HTC Vive Tracker (tay cầm)
-        ↓
-    OpenVR → ROS2 TF
-        ↓
-    Calibration → Robot target pose
-        ↓
-    ur_rtde → UR3 di chuyển
-        ↓
-    Robstride gripper (vô lăng + tay kẹp, bilateral)
-        ↓
-    Record: 2 camera + state + action → HDF5
-        ↓
-    Convert HDF5 → LeRobot dataset
-        ↓
-    Fine-tune Pi0.5
+┌─ THU DATA ─────────┐    ┌─ TRAIN PI0.5 ──┐    ┌─ INFERENCE ─────┐
+│ Vive Tracker       │    │ Pi0.5 base     │    │ Camera + state  │
+│ → UR3 + Gripper    │ →  │ + ur3 dataset  │ →  │ → Pi0.5         │
+│ → HDF5             │    │ → Checkpoint   │    │ → Robot tự làm  │
+└──────────────┬─────┘    └────────┬───────┘    └─────────────────┘
+               │                   │                      ▲
+               └── HuggingFace ────┴──────────────────────┘
+                   (qkhanh1/ur3_pick_cube)
+```
+
+### State + Action (cho Pi0.5)
+
+```
+State  (7 dim) = [joint1..joint6, gripper_pos_norm]
+Action (8 dim) = [x, y, z, qx, qy, qz, qw, gripper_cmd]
 ```
 
 ### Pipeline 8 terminal
 
-| Terminal | Node | Vai trò |
+| T | Node | Vai trò |
 |---|---|---|
-| T1 | `vive_tf_and_joy_ros2.py` | OpenVR → /tf + button |
-| T2 | `frame_as_posestamped_ros2.py` | TF → PoseStamped |
-| T3 | `vive_ur5_teleop_params.py` | Apply calibration → target pose |
-| T4 | `ur_follow_using_class_ros2.py` | UR3 follow target qua ur_rtde |
-| T5 | `realsense2_camera_node` | Camera front (top-down) |
-| T6 | `usb_cam_node_exe` | Camera wrist (gripper) |
-| T7 | `control_robstride_ros.py` | Gripper bilateral + ROS publish |
-| T8 | `record_all.py` | GUI record + HDF5 output |
+| 1 | `vive_tf_and_joy_ros2.py` | OpenVR → /tf + Joy (Ctrl_R toggle) |
+| 2 | `frame_as_posestamped_ros2.py` | TF → PoseStamped @60Hz |
+| 3 | `vive_ur5_teleop_params.py` | Apply yaw alignment → `/ur_target_pose` |
+| 4 | `ur_follow_using_class_ros2.py` | RTDE servoL @100Hz |
+| 5 | `./launch_realsense_all.sh` | 2 Realsense D435I đồng thời |
+| 6 | `control_robstride_ros_without_calip.py` | Gripper Mimic PID + `/gripper/state` |
+| 7 | `record_all.py` | HDF5 recorder |
 
 ---
 
-## 2. Phần Cứng
+## 2. Changelog — Các Fix Đã Làm
 
-### Robot
-- **Universal Robots UR3** với network IP `192.168.1.1`
-- Polyscope đã enable External Control / RTDE
+### 2.1 Driver UR: URBasic → ur_rtde
 
-### VR Tracking
-- **2 Lighthouses** SteamVR gắn tường
-- **1 Vive Tracker 3.0** cầm tay
-- **Headset** chỉ để init SteamVR
+**Lý do**: URBasic hay treo, lỗi `get_inverse_kin failed`, latency cao.
+**Mới**: `RTDEControlInterface` + `RTDEReceiveInterface`, servoL @100Hz, force/torque feedback.
 
-### Camera (BẮT BUỘC)
-- **Intel RealSense D435I** — front cam (top-down)
-- **Logitech C922 Pro** — wrist cam (gắn gripper)
-- ⚠️ **USB 3.0 cho Realsense** (cáp USB-C → USB-A 3.0)
-- 2 camera nên cắm vào 2 USB controller khác nhau
+### 2.2 Calibration: 4×4 Kabsch → góc yaw đơn giản
 
-### Gripper Robstride
-- **2 motor Robstride 06** (ID=7 master/vô lăng, ID=6 slave/tay kẹp)
-- Bilateral teleop với PID Mimic mode
-- Auto-stop khi chạm vật (torque detection)
-- Limits: `POS_OPEN_RAD=1.459`, `POS_CLOSE_RAD=8.509`
-
-### USB-CAN Adapter
-- **CANable2** với firmware slcan, bitrate 1Mbps
-- Termination resistor 120Ω giữa CAN_H/CAN_L
-
-### Máy tính
-- Ubuntu 22.04 LTS
-- ROS2 Humble
-
----
-
-## 3. Phần Mềm
-
-### ROS2 Humble
-```bash
-sudo apt update
-sudo apt install ros-humble-desktop \
-  ros-humble-realsense2-camera \
-  ros-humble-usb-cam \
-  ros-humble-tf-transformations \
-  ros-humble-cv-bridge
-```
-
-### Python packages
-```bash
-pip install ur_rtde scipy numpy opencv-python openvr pynput \
-            h5py python-can lerobot
-```
-
-### CAN tools
-```bash
-sudo apt install can-utils
-```
-
-### SteamVR
-- Cài qua Steam
-- Mở SteamVR TRƯỚC khi chạy ROS node
-
----
-
-## 4. Cấu Trúc Dự Án
-
-```
-~/ur5_teleop_vive/                          ← outer ROS workspace
-├── build/                                  ← gitignore
-├── install/                                ← gitignore
-├── log/                                    ← gitignore
-├── .gitignore
-├── README.md
-└── ur5_teleop_vive/                        ← ROS package
-    ├── CMakeLists.txt
-    ├── package.xml
-    ├── msg/
-    │   └── Xyzrpy.msg                      ← Custom msg
-    ├── launch/
-    │   └── view_ur5.launch.py              ← RViz visualization
-    ├── config/
-    ├── mesh/
-    │   └── hand.dae                        ← 3D model gripper
-    ├── resource/
-    └── ur5_teleop_vive/
-        └── thesis_code/                    ← Code chính
-            ├── vive_tf_and_joy_ros2.py
-            ├── frame_as_posestamped_ros2.py
-            ├── vive_ur5_teleop_params.py
-            ├── ur_follow_using_class_ros2.py
-            ├── control_robstride_ros.py    ← Gripper + ROS
-            ├── check_robstride.py          ← Test motor
-            ├── record_all.py               ← HDF5 recorder
-            ├── convert_hdf5_to_lerobot.py
-            ├── calib_4x4.py
-            └── dataset/                    ← gitignore (HDF5)
-```
-
-### Custom Message
-
-```
-# msg/Xyzrpy.msg
-std_msgs/Header header
-float64 x
-float64 y
-float64 z
-float64 roll
-float64 pitch
-float64 yaw
-```
-
-### ROS Topics
-
-| Topic | Type | Vai trò |
-|---|---|---|
-| `/right_controller_as_posestamped` | PoseStamped | Vive pose |
-| `/vive_right` | Joy | Button trigger |
-| `/ur_target_pose` | PoseStamped | Target cho robot |
-| `/ur_actual_pose` | Xyzrpy | TCP thực tế |
-| `/ur_joint_states` | JointState | 6 joints |
-| `/gripper/state` | Float32MultiArray | Gripper state (6 fields) |
-| `/camera/camera/color/image_raw` | Image | Front cam |
-| `/camera_wrist/image_raw` | Image | Wrist cam |
-
----
-
-## 5. (Tham khảo) Tạo ROS2 Package Từ Đầu
-
-> ⚠️ **Chương này CHỈ DÀNH cho người muốn dựng workspace từ scratch.**
-> Nếu bạn chỉ clone repo về dùng → **BỎ QUA chương này, đi tiếp chương 6**.
-
-Nếu dựng lại workspace trên máy mới:
-
-### 5.1 Tạo folder workspace
-
-```bash
-mkdir -p ~/ur5_teleop_vive/src
-cd ~/ur5_teleop_vive/src
-```
-
-### 5.2 Tạo ROS2 package
-
-```bash
-ros2 pkg create --build-type ament_cmake ur5_teleop_vive \
-    --dependencies rclcpp std_msgs geometry_msgs sensor_msgs
-```
+**Lý do**: Kabsch 8 điểm 3D phức tạp, dễ sai khi điểm gần đồng phẳng.
+**Mới** (`calib_manual.py`): chỉ đo **góc yaw** giữa trục X tracker và robot.
 
 Output:
 ```
-going to create a new package
-package name: ur5_teleop_vive
-destination directory: /home/khanh/ur5_teleop_vive/src
-package format: 3
-version: 0.0.0
-description: TODO: Package description
-maintainer: ['khanh <khanh@example.com>']
-licenses: ['TODO: License declaration']
-build type: ament_cmake
-dependencies: ['rclcpp', 'std_msgs', 'geometry_msgs', 'sensor_msgs']
-creating folder ./ur5_teleop_vive
-creating ./ur5_teleop_vive/package.xml
-creating source and include folder
-creating folder ./ur5_teleop_vive/src
-creating folder ./ur5_teleop_vive/include/ur5_teleop_vive
-creating ./ur5_teleop_vive/CMakeLists.txt
+world_alignment_angle.txt    ← -30.490862°  (giá trị thực tế đã đo)
+world_alignment_matrix.txt   ← Ma trận 4×4 tự sinh từ góc
 ```
 
-### 5.3 Tạo folder cần thiết
+### 2.3 Camera: C922 webcam → 2× Realsense D435I
+
+**Lý do**: `usb_cam` crash với mọi `pixel_format`. C922 chỉ USB 2.0.
+**Mới**: 2 Realsense cùng loại, cùng USB 3.0 (Bus 04 Thunderbolt 4).
+
+Cách launch 2 cam đồng thời:
+```bash
+./launch_realsense_all.sh
+```
+
+Topics:
+```
+/camera_front/camera/color/image_raw    ← serial 243322073847
+/camera_wrist/camera/color/image_raw    ← serial 027422070272
+```
+
+Vấn đề đã gặp khi setup:
+- Serial dạng số thuần → ROS2 parser tự cast sang integer → **fix**: bọc trong `\"...\"` trong bash
+- Namespace + node name → topic thêm `camera/` → **fix**: bỏ `-r __node:=...`, topic ra `/<ns>/camera/color/image_raw`
+- `rs-enumerate-devices -s` có ERROR log trước output → `awk` lấy sai cột → **fix**: dùng `grep -oE "[0-9]{12}"`
+- Realsense #2 cắm vào Bus 03 USB 2.0 (dù cổng nhìn xanh) → **fix**: tìm cổng Bus 04 Port 4 + Port 8
+
+### 2.4 Ctrl_R Toggle (tap thay vì hold)
+
+**Lý do**: Giữ phím liên tục mỏi tay, nhả lỡ là robot dừng giữa demo.
+**Mới**: Tap Ctrl_R 1 lần = ON, tap lần 2 = OFF. Edge detection chống OS autorepeat.
+
+```python
+if not _last_key_state:           # chỉ toggle khi vừa nhấn
+    is_space_pressed = not is_space_pressed
+_last_key_state = True
+```
+
+### 2.5 QoS Mismatch fix (`front ○` trong recorder)
+
+**Lý do**: Realsense publish **RELIABLE**, recorder cũ subscribe **BEST_EFFORT** → không nhận data.
+**Fix** trong `record_all.py`:
+
+```python
+qos_cam   = QoSProfile(reliability=RELIABLE,    depth=1)   # Realsense
+qos_robot = QoSProfile(reliability=BEST_EFFORT, depth=1)   # ur_follow, gripper
+```
+
+### 2.6 Realsense USB 3.0 (story thực tế)
+
+Lỗi `Frames didn't arrive within 5 seconds` dù cổng màu xanh.
+
+**Nguyên nhân**: Cổng USB-A đi qua hub USB 2.0 nội bộ → Realsense thấy Bus 03 (480M).
+
+**Verify**:
+```bash
+lsusb -t | grep uvcvideo
+# Phải thấy 5000M+ (USB 3.0)
+```
+
+Trên Tiger Lake-H: Bus 04 (Thunderbolt 4, 20000M) là USB 3.0 thật. Bus 03 (480M) = USB 2.0.
+
+### 2.7 pos_norm Gripper: dùng vô lăng, smooth 0→1
+
+**Cũ**: Normalize theo vị trí tay kẹp (pos_slave) dựa trên limit cơ học hardcode → không chính xác.
+**Mới**: Dùng **vị trí vô lăng (p_m)** để tính, smooth tuyến tính:
+
+```python
+MASTER_POS_OPEN  = -5.6    # rad → pos_norm = 0.0 (kẹp ra)
+MASTER_POS_CLOSE = -1.3    # rad → pos_norm = 1.0 (kẹp vào)
+
+pos_norm = (p_m - MASTER_POS_OPEN) / (MASTER_POS_CLOSE - MASTER_POS_OPEN)
+```
+
+Lý do smooth tốt hơn 0/1 cứng: Pi0.5 học trajectory liên tục → cần thấy gripper đóng dần từng bước.
+
+### 2.8 record_all.py: 2 QoS + GUI thread riêng
+
+- **2 QoS riêng**: `qos_cam` RELIABLE (Realsense), `qos_robot` BEST_EFFORT (robot/gripper)
+- **GUI thread**: cv2.imshow ở thread riêng ~15fps, không block ROS spin
+- **Default fps=20**: 10fps quá thưa cho Pi0.5
+
+### 2.9 convert_hdf5_to_lerobot.py: bỏ lerobot.common
+
+LeRobot v0.4.4+ xóa `lerobot.common.datasets`. Converter mới ghi parquet + MP4 + JSON trực tiếp.
+
+### 2.10 ROS_LOCALHOST_ONLY + ROS_DOMAIN_ID
+
+Thêm vào `~/.bashrc`:
+```bash
+export ROS_LOCALHOST_ONLY=1
+export ROS_DOMAIN_ID=0
+```
+
+Fix: DDS spam network errors + lỗi `Failed to find a free participant index`.
+
+---
+
+## 3. Phần Cứng
+
+### Robot
+- **Universal Robots UR3**, IP `192.168.1.1`
+- Polyscope: Remote Control mode (không cần URCap)
+
+### VR Tracking
+- **2× HTC Vive Base Station 2.0** gắn tường
+- **1× HTC Vive Tracker 3.0** cầm tay
+- Không cần Headset — config null driver (xem 7.4)
+
+### Camera
+- **2× Intel RealSense D435I**
+  - Front cam: serial `243322073847` → top-down nhìn xuống bàn
+  - Wrist cam: serial `027422070272` → gắn cạnh gripper
+  - Cả 2 cắm USB 3.0 Bus 04 (Port 4 + Port 8) trên máy
+
+### Gripper Robstride
+- **2× Robstride 06**:
+  - ID=7 MASTER = vô lăng (tay người cầm xoay)
+  - ID=6 SLAVE = tay kẹp (bám vô lăng qua PID Mimic)
+- PID Mimic: kp=13.2, ki=0.5, kd=1.0
+- **pos_norm range**: OPEN=-5.6 rad → 0.0 | CLOSE=-1.3 rad → 1.0
+
+### USB-CAN
+- **CANable2** slcan, bitrate 1Mbps (`-s8`), tự động detect `/dev/ttyACM*`
+
+### Máy tính
+- Ubuntu 22.04 LTS, ROS2 Humble
+- Tiger Lake-H: Bus 04 (Thunderbolt 4, 20Gbps) — cổng USB 3.0 thật
+
+---
+
+## 4. Phần Mềm
+
+### Python
 
 ```bash
-cd ~/ur5_teleop_vive/src/ur5_teleop_vive
-mkdir -p msg launch config mesh resource ur5_teleop_vive/thesis_code
+# python3.10 (lerobot/ur_rtde cài ở đây, không phải python3.12 default)
+python3.10 -m pip install \
+  ur_rtde pynput python-can h5py \
+  opencv-python pandas pyarrow \
+  huggingface_hub lerobot openvr \
+  "numpy<2"   # cv_bridge không tương thích NumPy 2.x
 ```
 
-### 5.4 Tạo custom message `msg/Xyzrpy.msg`
+### ROS2
 
 ```bash
-cat > msg/Xyzrpy.msg << 'EOF'
-std_msgs/Header header
-float64 x
-float64 y
-float64 z
-float64 roll
-float64 pitch
-float64 yaw
-EOF
+sudo apt install ros-humble-desktop \
+  ros-humble-realsense2-camera \
+  ros-humble-cv-bridge \
+  ros-humble-tf-transformations \
+  can-utils
 ```
 
-### 5.5 Sửa `CMakeLists.txt`
+---
 
-```cmake
-cmake_minimum_required(VERSION 3.8)
-project(ur5_teleop_vive)
+## 5. Cấu Trúc Dự Án
 
-if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-Wall -Wextra -Wpedantic)
-endif()
-
-# Dependencies
-find_package(ament_cmake REQUIRED)
-find_package(rosidl_default_generators REQUIRED)
-find_package(std_msgs REQUIRED)
-
-# Generate custom messages
-rosidl_generate_interfaces(${PROJECT_NAME}
-  "msg/Xyzrpy.msg"
-  DEPENDENCIES std_msgs
-)
-
-# Install Python scripts
-install(PROGRAMS
-  ur5_teleop_vive/thesis_code/vive_ur5_teleop_params.py
-  ur5_teleop_vive/thesis_code/ur_follow_using_class_ros2.py
-  ur5_teleop_vive/thesis_code/frame_as_posestamped_ros2.py
-  ur5_teleop_vive/thesis_code/vive_tf_and_joy_ros2.py
-  ur5_teleop_vive/thesis_code/control_robstride_ros.py
-  ur5_teleop_vive/thesis_code/record_all.py
-  ur5_teleop_vive/thesis_code/check_robstride.py
-  ur5_teleop_vive/thesis_code/calib_4x4.py
-  DESTINATION lib/${PROJECT_NAME}
-)
-
-# Install launch / config / mesh
-install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
-install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
-install(DIRECTORY mesh   DESTINATION share/${PROJECT_NAME})
-
-ament_export_dependencies(rosidl_default_runtime)
-ament_package()
+```
+~/ur5_teleop_vive/
+├── README.md
+└── ur5_teleop_vive/
+    ├── CMakeLists.txt
+    ├── package.xml
+    ├── msg/Xyzrpy.msg
+    ├── launch/view_ur5.launch.py
+    ├── mesh/hand.dae
+    └── ur5_teleop_vive/thesis_code/
+        │
+        ├── vive_tf_and_joy_ros2.py         ← OpenVR → TF + /vive_right Joy @90Hz
+        │                                     Ctrl_R = TOGGLE (tap, không hold)
+        │
+        ├── frame_as_posestamped_ros2.py    ← TF → /right_controller_as_posestamped @60Hz
+        │
+        ├── vive_ur5_teleop_params.py       ← Apply world_alignment_matrix.txt
+        │                                     → /ur_target_pose + /robot_origin_cmd
+        │                                     Phím Home = robot moveL đến vị trí tracker
+        │
+        ├── ur_follow_using_class_ros2.py   ← UR3 RTDE controller
+        │                                     ✅ ur_rtde (thay URBasic)
+        │                                     ✅ servoL @100Hz (control_dt=0.010)
+        │                                     ✅ 3 PRESET speed (đang dùng CÂN BẰNG: 5 m/s)
+        │                                     ✅ IK precheck + workspace clamp (min_z=0.05)
+        │                                     ✅ Glitch threshold 0.15m
+        │                                     ✅ TCP_OFFSET=0.175m
+        │                                     ✅ Publish: /joint_states /ur_joint_states
+        │                                               /ur_actual_pose /ee_pose
+        │                                               /ur_wrench /ur_joint_torque
+        │
+        ├── control_robstride_ros_without_calip.py  ← Gripper bilateral
+        │                                     ✅ PID Mimic + Safety Lock
+        │                                     ✅ pos_norm smooth theo vô lăng (p_m)
+        │                                       OPEN=-5.6 rad → 0.0
+        │                                       CLOSE=-1.3 rad → 1.0
+        │                                     ✅ Publish /gripper/state (6 fields)
+        │                                     ✅ CLI: --channel can0 --speed 1.5 --threshold 0.12
+        │
+        ├── launch_realsense_all.sh         ← Launch 2 Realsense đồng thời
+        │                                     serial_front=243322073847
+        │                                     serial_wrist=027422070272
+        │                                     Profile: 640x480x30 (USB 3.0)
+        │                                     Topics: /camera_{front,wrist}/camera/color/image_raw
+        │
+        ├── record_all.py                   ← HDF5 recorder
+        │                                     ✅ 2 QoS: qos_cam RELIABLE, qos_robot BEST_EFFORT
+        │                                     ✅ GUI cv2 thread riêng
+        │                                     ✅ Default --fps 20
+        │                                     TOPIC_FRONT = /camera_front/camera/color/image_raw
+        │                                     TOPIC_WRIST = /camera_wrist/camera/color/image_raw
+        │
+        ├── camera_check.py                 ← Live preview 2 cam (cần sửa topic)
+        │                                     TOPIC_FRONT = /camera_front/camera/color/image_raw
+        │                                     TOPIC_WRIST = /camera_wrist/camera/color/image_raw
+        │
+        ├── check_hdf5.py                   ← Inspect dataset
+        │                                     python3.10 check_hdf5.py dataset/pick_cube.hdf5
+        │                                     python3.10 check_hdf5.py --demo 0 --save
+        │
+        ├── Convert_hdf5_to_lerobot.py      ← HDF5 → LeRobot v2 (không cần lerobot.common)
+        ├── push_to_huggingface.py          ← Auto-detect + upload_folder
+        ├── inference.py                    ← Pi0.5 trên robot (post-train)
+        ├── calib_manual.py                 ← Calibration yaw (ghi world_alignment_*.txt)
+        │
+        ├── world_alignment_angle.txt       ← -30.490862° (std=0.043°)
+        ├── world_alignment_matrix.txt      ← Ma trận 4×4 tự sinh
+        │
+        └── dataset/                        ← .gitignore
+            └── pick_cube.hdf5
 ```
 
-### 5.6 Sửa `package.xml`
+### ROS Topics — Luồng dữ liệu
 
-```xml
-<?xml version="1.0"?>
-<package format="3">
-  <name>ur5_teleop_vive</name>
-  <version>0.0.1</version>
-  <description>UR3 teleop with HTC Vive for Pi0.5 dataset</description>
-  <maintainer email="khanh@email.com">Khanh</maintainer>
-  <license>MIT</license>
+```
+vive_tf ──/tf──→ frame_as_posestamped ──/right_controller_as_posestamped──→ vive_teleop
+vive_tf ──/vive_right (Joy)──────────────────────────────────────────────→ ur_follow
 
-  <buildtool_depend>ament_cmake</buildtool_depend>
+vive_teleop ──/ur_target_pose──→ ur_follow ──/ur_joint_states──→ record_all
+vive_teleop ──/robot_origin_cmd─→ ur_follow ──/ur_actual_pose──→ record_all
+                                             ──/ur_wrench───────→ (debug)
 
-  <depend>rclpy</depend>
-  <depend>std_msgs</depend>
-  <depend>geometry_msgs</depend>
-  <depend>sensor_msgs</depend>
+realsense (front) ──/camera_front/camera/color/image_raw──→ record_all
+realsense (wrist) ──/camera_wrist/camera/color/image_raw──→ record_all
 
-  <build_depend>rosidl_default_generators</build_depend>
-  <exec_depend>rosidl_default_runtime</exec_depend>
-  <member_of_group>rosidl_interface_packages</member_of_group>
-
-  <export>
-    <build_type>ament_cmake</build_type>
-  </export>
-</package>
+gripper ──/gripper/state──→ record_all
 ```
 
-### 5.7 Build workspace
+### /gripper/state fields
 
-```bash
-cd ~/ur5_teleop_vive
-colcon build --packages-select ur5_teleop_vive
-source install/setup.bash
-
-# Verify custom msg
-ros2 interface show ur5_teleop_vive/msg/Xyzrpy
-```
-
-Phải in ra:
-```
-std_msgs/Header header
-        builtin_interfaces/Time stamp
-                int32 sec
-                uint32 nanosec
-        string frame_id
-float64 x
-float64 y
-float64 z
-float64 roll
-float64 pitch
-float64 yaw
-```
-
-### 5.8 Copy code vào thesis_code
-
-```bash
-cd ~/ur5_teleop_vive/src/ur5_teleop_vive/ur5_teleop_vive/thesis_code
-# Copy tất cả .py từ repo vào đây
-```
-
-### 5.9 Build lại sau khi thêm code
-
-```bash
-cd ~/ur5_teleop_vive
-colcon build --packages-select ur5_teleop_vive
-source install/setup.bash
-```
+| Index | Field | Mô tả |
+|---|---|---|
+| 0 | pos_master | Vị trí vô lăng (rad) |
+| 1 | pos_slave | Vị trí tay kẹp (rad) |
+| 2 | **pos_norm** | 0.0=mở, 1.0=kẹp (Pi0.5 dùng) |
+| 3 | torque | Torque tay kẹp (N·m) |
+| 4 | contact | 0/1 — chạm vật |
+| 5 | mode | 0=IDLE, 1=AUTO, 2=MIMIC |
 
 ---
 
 ## 6. Cài Đặt và Build
 
-### Lần đầu trên máy mới
-
 ```bash
-# 1. Clone repo
+# Clone
 git clone https://github.com/Khanhiot-ai/ur3-vive-pi05.git ~/ur5_teleop_vive
 cd ~/ur5_teleop_vive
 
-# 2. Build
-colcon build --packages-select ur5_teleop_vive
+# Build
+colcon build --packages-select ur5_teleop_vive --symlink-install
 source install/setup.bash
 
-# 3. Auto-source mỗi terminal
-echo "source ~/ur5_teleop_vive/install/setup.bash" >> ~/.bashrc
+# Auto-source
+echo "source /opt/ros/humble/setup.bash"            >> ~/.bashrc
+echo "source ~/ur5_teleop_vive/install/setup.bash"  >> ~/.bashrc
+echo "export ROS_LOCALHOST_ONLY=1"                  >> ~/.bashrc
+echo "export ROS_DOMAIN_ID=0"                       >> ~/.bashrc
 source ~/.bashrc
 ```
 
-### Verify
-
+Verify:
 ```bash
-ros2 interface show ur5_teleop_vive/msg/Xyzrpy   # phải có
-ping 192.168.1.1                                  # UR3
-ls /dev/ttyACM*                                   # CANable2
+ros2 interface show ur5_teleop_vive/msg/Xyzrpy
+ping -c 3 192.168.1.1
+ls /dev/ttyACM*
 ```
 
 ---
@@ -396,413 +370,472 @@ ls /dev/ttyACM*                                   # CANable2
 
 ### 7.1 Setup CAN cho Robstride
 
-Script auto-setup:
+**Thủ công** (mỗi lần cắm CANable2):
+```bash
+# Tìm port
+ls /dev/ttyACM*
 
+# Bring up CAN interface
+sudo slcand -o -c -s8 /dev/ttyACM0 can0   # ← đổi ttyACMX theo ls ở trên
+sudo ip link set can0 up
+sudo ip link set can0 txqueuelen 1000
+
+# Kiểm tra
+ip link show can0
+# Phải thấy: state UP
+```
+
+**Script tự động** (khuyến nghị):
 ```bash
 cat > ~/setup_can.sh << 'EOF'
 #!/bin/bash
 CANABLE=$(ls -t /dev/ttyACM* 2>/dev/null | head -1)
-if [ -z "$CANABLE" ]; then
-    echo "❌ Không tìm thấy CANable2 — cắm USB chưa?"
-    exit 1
-fi
-echo "🔍 CANable2 ở: $CANABLE"
-sudo pkill slcand 2>/dev/null
-sleep 0.5
+[ -z "$CANABLE" ] && echo "❌ Không thấy CANable2" && exit 1
+echo "Found: $CANABLE"
+sudo pkill slcand 2>/dev/null; sleep 0.5
 sudo ip link set can0 down 2>/dev/null
 sudo slcand -o -c -s8 $CANABLE can0
 sleep 0.5
 sudo ip link set can0 up
 sudo ip link set can0 txqueuelen 1000
-ip link show can0 | grep -q UP && echo "✅ can0 UP!" || echo "❌ Setup fail"
+ip link show can0 | grep -q "state UP" && echo "✅ can0 UP!" || echo "❌ Fail"
 EOF
 chmod +x ~/setup_can.sh
 ```
 
-Mỗi lần cắm CANable2:
-```bash
-~/setup_can.sh
-```
-
-### 7.2 Test motor
+### 7.2 Test motor Robstride
 
 ```bash
-python3 check_robstride.py --scan
-python3 check_robstride.py --read --id 6 --id 7
-python3 check_robstride.py --test --id 7 --speed 0.5
+python3.10 check_robstride.py --scan
+# → ✅ FOUND ID=6 và ID=7
 ```
 
-### 7.3 Test camera
+### 7.3 Verify 2 Realsense USB 3.0
 
 ```bash
-v4l2-ctl --list-devices
-realsense-viewer
+lsusb -t | grep uvcvideo
+# Phải thấy CẢ 2 thiết bị ở 5000M trên Bus 04
 
-# USB speed (Realsense phải 5000M)
-ls /sys/bus/usb/devices/ | xargs -I{} sh -c \
-  'echo -n "{}: "; cat /sys/bus/usb/devices/{}/speed 2>/dev/null'
+rs-enumerate-devices | grep -E "Serial Number|Usb Type"
+# Cả 2 phải: Usb Type Descriptor: 3.2
 ```
 
-### 7.4 SteamVR — Chạy KHÔNG cần Headset
+Cổng đúng trên máy này: **Bus 04 Port 4** và **Bus 04 Port 8** (Thunderbolt 4).
 
-Dự án này dùng Vive Tracker mà **KHÔNG cắm headset**, nên SteamVR phải được cấu hình để bỏ qua yêu cầu headset.
+### 7.4 SteamVR không cần Headset
 
-**Phải sửa 2 file config của SteamVR.**
-
-#### Tìm Steam directory
-
-Trên Ubuntu, Steam directory thường ở:
-```bash
-# Cài qua website Steam
-~/.local/share/Steam/
-
-# Cài qua apt (package manager)
-~/.steam/
-
-# Verify
-ls ~/.local/share/Steam/steamapps/common/SteamVR/ 2>/dev/null &&   STEAM_DIR=~/.local/share/Steam ||   STEAM_DIR=~/.steam
-echo "Steam dir: $STEAM_DIR"
-```
-
-#### File 1: Bật Null Driver
-
-Mở file:
+**File 1**:
 ```bash
 nano ~/.local/share/Steam/steamapps/common/SteamVR/drivers/null/resources/settings/default.vrsettings
+# Đổi "enable": false → true
 ```
 
-Tìm dòng:
-```json
-"enable": false,
-```
-
-Đổi thành:
-```json
-"enable": true,
-```
-
-#### File 2: Tắt yêu cầu HMD
-
-Mở file:
+**File 2**:
 ```bash
 nano ~/.local/share/Steam/steamapps/common/SteamVR/resources/settings/default.vrsettings
+# Sửa:
+# "requireHmd": false,
+# "forcedDriver": "null",
+# "activateMultipleDrivers": true,
 ```
 
-Sửa 3 dòng:
-```json
-"requireHmd": false,              ← từ true
-"forcedDriver": "null",           ← từ ""
-"activateMultipleDrivers": true,  ← từ false
-```
-
-#### Verify
-
-Khởi động lại SteamVR:
-```bash
-# Đóng SteamVR nếu đang chạy, rồi mở lại
-steam steam://launch/250820
-```
-
-SteamVR sẽ hiện cửa sổ status với:
-- ✅ Không báo lỗi "headset not detected"
-- ✅ Tracker hiện xanh (đèn xanh trên tracker, icon xanh trong SteamVR)
-- ✅ 2 lighthouse hiện xanh
-
-#### ⚠️ Lưu ý quan trọng
-
-**SteamVR sẽ tự ghi đè 2 file này khi update.** Để giữ vĩnh viễn, copy các settings vào file user:
+### 7.5 Verify gripper pos_norm
 
 ```bash
-# Tìm file user (có thể không tồn tại, tạo nếu chưa có)
-USER_CONFIG=~/.local/share/Steam/config/steamvr.vrsettings
-
-# Nếu không có, tạo file với nội dung:
-cat > $USER_CONFIG << 'JSON'
-{
-   "steamvr" : {
-      "requireHmd" : false,
-      "forcedDriver" : "null",
-      "activateMultipleDrivers" : true
-   },
-   "driver_null" : {
-      "enable" : true
-   }
-}
-JSON
+python3.10 control_robstride_ros_without_calip.py --channel can0
+# Gõ 'm' → MIMIC ON
 ```
 
-File user **không bị SteamVR ghi đè khi update**.
+Terminal khác:
+```bash
+ros2 topic echo /gripper/state --field data
+```
 
-#### Reference
+Xoay vô lăng từ mở hết → kẹp hết:
+- `data[0]` (vô lăng) phải đi từ ~ **-5.6 → -1.3 rad**
+- `data[2]` (pos_norm) phải đi từ **0.0 → 1.0** mượt mà
 
-Hướng dẫn gốc: https://github.com/username223/SteamVRNoHeadset
+Nếu range khác → sửa 2 dòng trong file:
+```python
+MASTER_POS_OPEN  = -5.6    # ← đổi thành giá trị đo được khi mở hết
+MASTER_POS_CLOSE = -1.3    # ← đổi thành giá trị đo được khi kẹp hết
+```
 
 ---
 
-## 8. Calibration
+## 8. Calibration (góc yaw)
 
-```bash
-python3 calib_4x4.py
+### Tại sao chỉ cần yaw?
+
+Vive lighthouse + UR3 đều đứng thẳng → trục Z song song → chỉ khác góc yaw quanh Z. Không cần Kabsch 4×4.
+
+### Kết quả đã có
+
+```
+world_alignment_angle.txt: -30.490862°
+Std dev: 0.043° → EXCELLENT (< 0.5°)
 ```
 
-1. Gắn Vive tracker lên flange UR3
-2. Di chuyển robot đến **8 điểm** rải đều 3D
-3. Mỗi điểm ≥ 10cm, KHÔNG đồng phẳng
-4. Output: `world_alignment_matrix.txt`
+File đã có, không cần calib lại trừ khi di chuyển lighthouse hoặc robot.
 
-| RMSE | Đánh giá |
+### Calib lại khi cần
+
+```bash
+python3.10 calib_manual.py
+# 1. Gắn tracker lên flange UR3
+# 2. Dùng Teach Pendant di chuyển theo trục X+ (~10cm, 5 đoạn)
+# 3. Script tính góc + lưu world_alignment_*.txt
+```
+
+| Std dev | Đánh giá |
 |---|---|
-| < 5mm | Excellent |
-| < 10mm | Good |
-| < 20mm | Acceptable |
-| > 20mm | Làm lại |
+| < 0.5° | Excellent |
+| < 1.0° | Good |
+| < 2.0° | Acceptable |
+| > 2.0° | Calib lại |
 
 ---
 
 ## 9. Workflow Thu Data
 
-### 9.1 Setup CAN + verify motor
+### 9.1 Chuẩn bị
 
 ```bash
 ~/setup_can.sh
-python3 check_robstride.py --scan
+python3.10 check_robstride.py --scan   # → FOUND ID=6 và ID=7
 ```
 
-### 9.2 Mở 8 terminal (source workspace mỗi terminal)
+### 9.2 Mở 7 terminals
 
+**T1 — Vive bridge** (Ctrl_R TOGGLE):
 ```bash
-source ~/ur5_teleop_vive/install/setup.bash
+python3.10 vive_tf_and_joy_ros2.py
 ```
 
-**T1 — Vive bridge:**
+**T2 — TF converter**:
 ```bash
-python3 vive_tf_and_joy_ros2.py
+python3.10 frame_as_posestamped_ros2.py
 ```
 
-**T2 — TF converter:**
+**T3 — Teleop logic**:
 ```bash
-python3 frame_as_posestamped_ros2.py
+python3.10 vive_ur5_teleop_params.py
 ```
 
-**T3 — Teleop logic:**
+**T4 — UR3 RTDE**:
 ```bash
-python3 vive_ur5_teleop_params.py
+python3.10 ur_follow_using_class_ros2.py
+```
+Phải thấy:
+```
+║  Max Speed: 5.00 m/s                     ║
+✓ RTDE connected: 192.168.1.1
+✓ Control loop: 100 Hz (10.0ms)
+SYSTEM READY TO CONTROL
 ```
 
-**T4 — UR3 controller:**
+**T5 — 2 Realsense**:
 ```bash
-python3 ur_follow_using_class_ros2.py
+./launch_realsense_all.sh
 ```
-Đợi: `SYSTEM READY — RTDE @ 100Hz`
 
-**T5 — Realsense front:**
+**T6 — Gripper**:
 ```bash
-ros2 run realsense2_camera realsense2_camera_node --ros-args \
-  -p enable_depth:=false -p enable_infra1:=false -p enable_infra2:=false \
-  -p enable_gyro:=false -p enable_accel:=false \
-  -p rgb_camera.color_profile:="640x480x30"
+python3.10 control_robstride_ros_without_calip.py --channel can0 --speed 1.5 --threshold 0.12
+# Gõ 'm' + Enter → MIMIC ON
 ```
 
-**T6 — Wrist cam:**
+**T7 — Recorder**:
 ```bash
-ros2 run usb_cam usb_cam_node_exe --ros-args \
-  -p video_device:=/dev/video8 \
-  -p pixel_format:=mjpeg2rgb \
-  -p image_width:=640 -p image_height:=480 -p framerate:=30.0 \
-  -r image_raw:=/camera_wrist/image_raw
+python3.10 record_all.py --task pick_cube --fps 20
 ```
 
-**T7 — Gripper:**
+### 9.3 Verify trước khi ghi
+
+Status bar `record_all.py` phải hiện đủ 5 chấm xanh:
+```
+front ●#xxx  wrist ●#xxx  joints ●  target ●  grip ●
+```
+
+Check FPS (terminal khác):
 ```bash
-python3 control_robstride_ros.py --channel can0
+ros2 topic hz /camera_front/camera/color/image_raw    # ~30Hz
+ros2 topic hz /camera_wrist/camera/color/image_raw    # ~30Hz
+ros2 topic hz /ur_actual_pose                         # ~100Hz
+ros2 topic hz /gripper/state                          # ~100Hz
 ```
 
-**T8 — Recorder:**
-```bash
-python3 record_all.py --task pick_cube --fps 10
-```
+### 9.4 Phím điều khiển
 
-### 9.3 Phím tắt
+| Phím | Tác dụng | Terminal focus |
+|---|---|---|
+| `Ctrl_R` (tap) | Toggle robot bám tracker ON/OFF | T1 |
+| `Home` | Robot moveL đến vị trí tracker | T3 |
+| `m` + Enter | Bật MIMIC gripper | T6 |
+| `+`/`-` + Enter | Tăng/giảm speed gripper | T6 |
+| `SPACE` | Bắt đầu / Dừng ghi | T7 |
+| `S` | Lưu SUCCESS ✅ | T7 |
+| `F` | Lưu FAIL ❌ | T7 |
+| `Q` | Thoát | T7 |
 
-**Robot teleop (T1):**
-- **Home** — Set origin
-- **Ctrl_R** — Toggle ON/OFF teleop
-
-**Gripper (T7):**
-- **Enter** — Auto start/stop
-- **m** — Bật/tắt MIMIC (bilateral)
-- **+/-** — Speed
-- **r** — Đổi chiều
-
-**Recorder GUI (T8):**
-- **SPACE** — Bắt đầu / dừng
-- **S** — Save SUCCESS
-- **F** — Save FAIL
-- **Q** — Thoát
-
-### 9.4 Quy trình 1 episode
+### 9.5 Quy trình 1 episode (5-15s)
 
 ```
-1. GUI: 2 cam viền xanh + 4 indicator ● (joints, actual, target, gripper)
-
-2. Robot về home, đặt vật lên bàn
-
-3. Ctrl_R → robot follow Vive
-   'm' trong T7 → MIMIC gripper
-
-4. SPACE trong recorder → bắt đầu ghi
-
-5. Demo:
-   - Vive di chuyển → UR3 tới vị trí gắp
-   - Vặn vô lăng → tay kẹp đóng
-   - Vive di chuyển → đến vị trí thả
-   - Vặn ngược → tay kẹp mở
-
-6. S (success) / F (fail)
-
-7. Lặp lại
+1. Đặt vật ở vị trí mới (đa dạng hóa mỗi demo)
+2. Tap Ctrl_R OFF (robot đứng yên)
+3. Bấm Home (T3 focus) → robot về vị trí tracker
+4. T7: SPACE → 🔴 REC bắt đầu
+5. Tap Ctrl_R ON → robot bám tracker
+6. Di chuyển tracker đến vật
+7. Xoay vô lăng → gripper đóng kẹp (data[2] → 1.0)
+8. Di chuyển đến vị trí thả
+9. Xoay vô lăng ngược → gripper mở (data[2] → 0.0)
+10. Tap Ctrl_R OFF
+11. T7: S (success) ✅ hoặc F (fail) ❌
 ```
 
-### 9.5 Số lượng episode khuyến nghị
+### 9.6 Mục tiêu
 
-| Mục đích | Số episode |
+| Demos | Pi0.5 success rate |
 |---|---|
-| Test pipeline | 1-5 |
-| Pi0.5 cơ bản | 50-100 |
-| Pi0.5 quality | 200-500 |
-| Pi0.5 robust | 1000+ |
-
-Đa dạng hóa: vị trí vật, hướng, ánh sáng. **Giữ nguyên camera.**
+| 10 | Test pipeline |
+| 50 | 30-50% |
+| 100 | 60-75% |
+| 200+ | 80-90% (thesis quality) |
 
 ---
 
-## 10. Format Dataset HDF5
+## 10. Check Dataset HDF5
 
-### Schema
+### Kiểm tra tổng quan
+
+```bash
+cd ~/ur5_teleop_vive/ur5_teleop_vive/ur5_teleop_vive/thesis_code
+
+# Auto-detect file hdf5 trong dataset/
+python3.10 check_hdf5.py
+
+# Hoặc chỉ rõ file
+python3.10 check_hdf5.py dataset/pick_cube.hdf5
+```
+
+Output hiện: số demo, success/fail, frames/duration, schema check, action sanity.
+
+### Xem ảnh demo
+
+```bash
+# Lưu ảnh ra /tmp/ (5 frame đại diện)
+python3.10 check_hdf5.py --demo 0 --save
+xdg-open /tmp/demo0_frame0000_front.jpg
+xdg-open /tmp/demo0_frame0000_wrist.jpg
+
+# Xem trực tiếp cửa sổ cv2
+python3.10 check_hdf5.py --demo 0
+# Nhấn phím bất kỳ để xem frame tiếp
+```
+
+### Cảnh báo thường gặp
+
+| Cảnh báo | Nguyên nhân | Fix |
+|---|---|---|
+| `XYZ không thay đổi` | Robot không di chuyển | Ctrl_R chưa ON |
+| `Gripper không đóng` | MIMIC chưa bật | Gõ `m` trong T6 trước khi SPACE |
+| `Episode > 60s` | Demo quá dài | Nên 5-15s/demo |
+| `0 success demos` | Quên bấm S | Bấm S sau mỗi demo |
+| `wrist_image MISSING` | Topic wrist sai | Check TOPIC_WRIST trong record_all.py |
+
+---
+
+## 11. Format Dataset HDF5
 
 ```
-dataset/<task>.hdf5
-└── data/                                  attrs: task, fps, robot, state_dim, action_dim
-    ├── demo_0/                            attrs: success, n_frames, fps_actual, duration_s
+dataset/pick_cube.hdf5
+└── data/                              attrs: task, fps=20, state_dim=7, action_dim=8
+    ├── demo_0/                        attrs: success, n_frames, fps_actual, duration_s
     │   ├── obs/
-    │   │   ├── image           uint8  (T, 224, 224, 3)
-    │   │   ├── wrist_image     uint8  (T, 224, 224, 3)
-    │   │   ├── state           f32    (T, 7)
-    │   │   └── tactile_state   f32    (T, 1)
-    │   └── actions             f32    (T, 8)
-    └── demo_1/, demo_2/, ...
+    │   │   ├── image          uint8  (T, 224, 224, 3)   ← Realsense front
+    │   │   ├── wrist_image    uint8  (T, 224, 224, 3)   ← Realsense wrist
+    │   │   ├── state          f32    (T, 7)             ← joints[6] + gripper_norm[1]
+    │   │   └── tactile_state  f32    (T, 1)             ← gripper torque
+    │   └── actions            f32    (T, 8)             ← xyz + quat + gripper_cmd
+    ├── demo_1/, demo_2/, ...
 ```
 
-**State (7 dim):**
-- `[0:6]` — 6 joint angles (rad)
-- `[6]` — Gripper position [0=mở, 1=đóng]
+### Vai trò field cho Pi0.5
 
-**Action (8 dim):**
-- `[0:3]` — TCP target XYZ (m)
-- `[3:7]` — TCP target quaternion
-- `[7]` — Gripper command [0,1]
-
-**Tactile (1 dim):**
-- `[0]` — Gripper torque (N·m)
-
-### Verify
-
-```bash
-python3 << 'EOF'
-import h5py
-with h5py.File('dataset/pick_cube.hdf5', 'r') as f:
-    print('Demos:', list(f['data'].keys()))
-    for name in f['data']:
-        g = f['data'][name]
-        print(f'  {name}: {g.attrs["n_frames"]}f  success={g.attrs["success"]}')
-EOF
-```
+| Field | Mục đích | Quan trọng |
+|---|---|---|
+| `image` | Vision encoder — scene tổng thể | ★★★ |
+| `wrist_image` | Vision encoder — close-up gripper | ★★★ |
+| `state` | Proprioception robot | ★★★ |
+| `actions` | **Ground truth** Pi0.5 predict | ★★★ |
+| `tactile_state` | Force feedback | ★★ |
 
 ---
 
-## 11. Convert sang LeRobot
+## 12. Convert + Push HuggingFace
+
+### Convert HDF5 → LeRobot v2
 
 ```bash
-pip install lerobot
-
-python3 convert_hdf5_to_lerobot.py \
+python3.10 Convert_hdf5_to_lerobot.py \
   --src dataset/pick_cube.hdf5 \
-  --repo-id khanh/ur3_pick_cube \
   --task "pick up the red cube" \
-  --fps 10 \
-  --skip-failed
+  --fps 20 \
+  --image-size 224 \
+  --skip-failed \
+  --overwrite
 ```
 
-Output: `~/.cache/huggingface/lerobot/khanh/ur3_pick_cube/`
+Output `dataset/pick_cube_lerobot/`:
+```
+meta/{info.json, episodes.jsonl, tasks.jsonl, stats.json}
+data/chunk-000/episode_NNNNNN.parquet
+videos/chunk-000/observation.{image,wrist_image}_episode_NNNNNN.mp4
+```
 
-### Push lên HuggingFace Hub
+### Push lên HuggingFace
 
 ```bash
+# Login 1 lần
 huggingface-cli login
-python3 -c "
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-LeRobotDataset('khanh/ur3_pick_cube').push_to_hub()
-"
+huggingface-cli whoami    # → qkhanh1
+
+# Push
+python3.10 push_to_huggingface.py --repo-id qkhanh1/ur3_pick_cube
 ```
 
 ---
 
-## 12. Troubleshooting
+## 13. Inference Pi0.5 trên Robot
 
-### Camera không hiện
-- `v4l2-ctl --list-devices` để tìm device mới
-- USB speed phải 5000M cho Realsense
+### Train trên Colab/GPU
 
-### `actual: null`
-- Chưa source workspace:
-  ```bash
-  source ~/ur5_teleop_vive/install/setup.bash
-  ros2 topic echo /ur_actual_pose --once
-  ```
-
-### Robot không di chuyển
-- Kiểm tra `SYSTEM READY` ở T4
-- Đã nhấn **Home** rồi **Ctrl_R** chưa?
-- SteamVR thấy tracker xanh không?
-
-### Gripper không phản hồi
-- CAN UP? `ip link show can0`
-- Motor sống? `python3 check_robstride.py --scan`
-- Bitrate đúng 1Mbps? `slcan -s8`
-
-### Robot rung khi Vive đứng yên
-Tăng deadzone trong `ur_follow_using_class_ros2.py`:
 ```python
-self.deadzone_enter = 0.015      # 15mm
-self.deadzone_exit = 0.008       # 8mm
-self.orient_deadzone_deg = 3.0
+!pip install lerobot openpi
+from huggingface_hub import login
+login(token="hf_xxx")
+
+!python -m openpi.train \
+  --dataset qkhanh1/ur3_pick_cube \
+  --model pi0.5-base \
+  --epochs 50
+
+from huggingface_hub import upload_folder
+upload_folder(folder_path="./checkpoints/final",
+              repo_id="qkhanh1/pi0.5_ur3_pickcube",
+              repo_type="model")
 ```
 
-### DDS spam errors
+### Inference trên robot thật
+
 ```bash
-export ROS_LOCALHOST_ONLY=1
-echo "export ROS_LOCALHOST_ONLY=1" >> ~/.bashrc
+# Download checkpoint
+huggingface-cli download qkhanh1/pi0.5_ur3_pickcube \
+  --local-dir ~/checkpoints/pi0.5_ur3_pickcube
+
+# Chạy pipeline T1-T6 như thu data (bỏ T3 vive_teleop)
+# T7: inference thay record_all
+python3.10 inference.py \
+  --checkpoint ~/checkpoints/pi0.5_ur3_pickcube \
+  --task "pick up the red cube"
 ```
 
-### Realsense delay 1-2s
-Driver issue, không fix được hoàn toàn. Không ảnh hưởng dataset (recorder dùng `time.time()`).
-
-### `ros2 interface show Xyzrpy` not found
-```bash
-cd ~/ur5_teleop_vive
-colcon build --packages-select ur5_teleop_vive
-source install/setup.bash
+⚠️ Đổi sang PRESET AN TOÀN trước khi test Pi0.5 (sửa `ur_follow_using_class_ros2.py` dòng 80-83):
+```python
+self.normal_max_speed = 0.5    # PRESET AN TOÀN
 ```
 
-### File > 100MB khi push
-```bash
-find . -type f -size +50M -not -path "./.git/*"
+---
 
-git filter-branch --force --index-filter \
-  "git rm -r --cached --ignore-unmatch path/to/big_file" \
-  --prune-empty --tag-name-filter cat -- --all
-git push --force
-```
+## 14. Troubleshooting
+
+### Robot UR3
+
+| Lỗi | Fix |
+|---|---|
+| `get_inverse_kin failed` | IK precheck + workspace clamp đã có trong file mới |
+| `RTDE connection failed` | Robot chưa ở Remote Control mode |
+| `Protective stop` | Restart trên teach pendant |
+| Robot quá nhanh/mạnh | Đổi sang PRESET AN TOÀN (max_speed=0.5) |
+| Robot lao 1 hướng | Tap Ctrl_R OFF, kiểm tra calib |
+
+### Camera Realsense
+
+| Lỗi | Fix |
+|---|---|
+| `Frames didn't arrive` | USB 2.0 — cắm Bus 04 Port 4/8 |
+| `Device busy (errno=16)` | Có process khác giữ camera — `pkill -9 -f realsense2_camera_node` |
+| FPS chỉ 0.5Hz | Profile không support hoặc bandwidth — thử `1280x720x30` |
+| Serial not found | `rs-enumerate-devices -s` xem serial đúng |
+| Serial type mismatch | Bọc serial trong `\"...\"` trong bash script |
+| Topic `/camera_front/camera_front_node/...` | Bỏ `-r __node:=...` trong launch script |
+
+### Camera C922 (nếu còn dùng)
+
+| Lỗi | Fix |
+|---|---|
+| `pixel_format unsupported` | Không dùng usb_cam — dùng `wrist_cam.py` (OpenCV) |
+| Device không tìm thấy | `wrist_cam.py` có auto-detect qua v4l2-ctl |
+
+### QoS / Topic
+
+| Lỗi | Fix |
+|---|---|
+| `front ○` trong recorder | Realsense RELIABLE, recorder cũ BEST_EFFORT — dùng file mới có 2 QoS |
+| `RCLError: rmw handle is invalid` | Terminal chưa source ROS2 — `source ~/.bashrc` |
+| `Failed to find a free participant index` | Quá nhiều ROS2 node — `pkill -f ros2`, thêm `ROS_DOMAIN_ID=0` |
+
+### Vive / SteamVR
+
+| Lỗi | Fix |
+|---|---|
+| Tracker xám | Giữ nút tracker 3s bật lại, check pin |
+| SteamVR đòi headset | Sửa 2 file vrsettings (7.4) |
+| Robot không bám tracker | Click vào terminal T1, xem log `[TOGGLE] Trigger ON 🟢` |
+
+### Gripper Robstride
+
+| Lỗi | Fix |
+|---|---|
+| `can3: No such device` | Sai interface — dùng `--channel can0` |
+| `can0 not found` | CAN chưa setup — chạy `~/setup_can.sh` |
+| Motor 6 không respond | Check dây CAN daisy-chain |
+| `/gripper/state` không publish | Dùng đúng file `control_robstride_ros_without_calip.py` |
+| `pos_norm` không về 1.0 khi kẹp | Sửa `MASTER_POS_CLOSE` theo giá trị đo thực |
+| `pos_norm` stuck ở 0.0 | Sửa `MASTER_POS_OPEN` theo giá trị đo thực |
+
+### CAN bus
+
+| Lỗi | Fix |
+|---|---|
+| `slcand: device busy` | `sudo pkill slcand` rồi setup lại |
+| `Permission denied /dev/ttyACM*` | `sudo usermod -aG dialout $USER` rồi logout/login |
+| CANable ở `/dev/ttyACM3` không phải `ttyACM0` | Script `setup_can.sh` tự tìm `ttyACM*` đầu tiên |
+
+### HDF5 / Recorder
+
+| Lỗi | Fix |
+|---|---|
+| GUI đơ | GUI thread riêng đã có trong file mới |
+| `gripper = 0` toàn bộ demo | MIMIC chưa bật — gõ `m` trong T6 trước SPACE |
+| `XYZ range = 0` | Ctrl_R chưa ON khi ghi |
+| Demo 60s+ | Mỗi demo 5-15s — 1 hành động pick+place duy nhất |
+
+### Convert / Push
+
+| Lỗi | Fix |
+|---|---|
+| `ModuleNotFoundError: lerobot.common` | Dùng `Convert_hdf5_to_lerobot.py` mới |
+| Push "Auth" fail | `huggingface-cli login` lại với Write token |
+| `python3` không có lerobot | Dùng `python3.10` |
+
+### Git
+
+| Lỗi | Fix |
+|---|---|
+| File `ur_log/*.log` (1.4GB) reject | `.gitignore` add `ur_log/`, `dataset/`, `*.log` |
+| Push reject > 50MB | `git filter-branch --force --index-filter "git rm --cached path"` |
 
 ---
 
@@ -812,14 +845,8 @@ git push --force
 - **openpi**: https://github.com/Physical-Intelligence/openpi
 - **LeRobot**: https://github.com/huggingface/lerobot
 - **ur_rtde**: https://sdurobotics.gitlab.io/ur_rtde/
-- **Robstride**: https://www.robstride.com/
+- **SteamVR no-headset**: https://github.com/username223/SteamVRNoHeadset
 
 ---
 
-## 📄 License
-
-MIT — Tự do sử dụng, sửa đổi.
-
----
-
-*Updated: May 2026 — Khanh (UR3 thesis project)*
+*README v7 — May 2026 — qkhanh1 (UR3 thesis)*
