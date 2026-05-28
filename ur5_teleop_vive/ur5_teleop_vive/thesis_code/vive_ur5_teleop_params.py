@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
 """
 Teleoperation với World Alignment Matrix
-
-[FIX 1] Xóa DEBUG log spam 100Hz → throttle 1Hz
-[FIX 2] Hoàn thiện apply_world_alignment: thêm BƯỚC 1-3 translation còn thiếu
-[FIX 3] workspace_check tạo 1 lần trong __init__
-[FIX 4] get_clock().now() gọi 1 lần dùng lại
-[FIX 5] Thêm orientation thật từ tracker vào target (xoay tay = xoay TCP)
-        Home → reset orientation về top-down (1,0,0,0)
+Thay thế hardcoded rotation bằng ma trận từ calibration
 """
 
 import sys
@@ -16,162 +10,156 @@ import math
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
+# ROS 2 Imports
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from geometry_msgs.msg import PoseStamped, TransformStamped, Pose
+# from sensor_msgs.msg import Joy
 from visualization_msgs.msg import Marker
 from tf2_ros import TransformBroadcaster, TransformListener, Buffer
 
+# Custom message for robot pose
 try:
     from ur5_teleop_vive.msg import Xyzrpy
 except ImportError:
-    Xyzrpy = None
+    Xyzrpy = None  # Fallback if message not available
 
+# Keyboard Input for Relative Control
 from pynput import keyboard
 
-# Quaternion top-down cố định (gripper nhìn xuống) — dùng khi Home
-TOP_DOWN_QUAT = np.array([1.0, 0.0, 0.0, 0.0])  # [x, y, z, w]
-
-
 # ============================================
-# Relative Control Class — GIỮ NGUYÊN LOGIC, thêm orientation
+# Relative Control Class
 # ============================================
 class RelativeControlWithKeyboard:
+    """
+    Relative Control với keyboard input:
+    - Home: Set origin (lấy vị trí gốc)
+    """
     def __init__(self, logger):
         self.logger = logger
+        
+        # State
         self.tracker_origin = None
         self.robot_origin = None
-        self.origin_rot = None   # R_tracker lúc Home (để tính delta rotation)
-        self.tcp_origin_rot = None  # R_tcp lúc Home (top-down)
         self.origin_set = False
+        
+        # Keyboard state
         self.home_pressed = False
         self.last_home_state = False
-
+        
+        # Start keyboard listener
         self.listener = keyboard.Listener(
             on_press=self._on_key_press,
             on_release=self._on_key_release
         )
         self.listener.start()
-
+        
         self.logger.info("🎮 Relative Control initialized")
         self.logger.info("   Home: Set origin (press to capture)")
-
+    
     def _on_key_press(self, key):
+        """Callback khi nhấn phím"""
         try:
-            self.logger.debug(f"Key pressed: {key}")
+            # Home key
             if key == keyboard.Key.home:
-                self.logger.info("✅ HOME KEY DETECTED!")
                 self.home_pressed = True
         except AttributeError:
             pass
-
+    
     def _on_key_release(self, key):
+        """Callback khi nhả phím"""
         try:
+            # Home key
             if key == keyboard.Key.home:
                 self.home_pressed = False
         except AttributeError:
             pass
-
-    def update(self, tracker_pose_matrix, robot_current_pose, workspace_check=None, robot_current_quat=None):
+    
+    def update(self, tracker_pose_matrix, robot_current_pose, workspace_check=None):
         """
+        Update mỗi frame
+        
+        Args:
+            tracker_pose_matrix: 4x4 matrix (đã qua World Alignment)
+            robot_current_pose: np.array [x, y, z]
+            workspace_check: Function(point) -> bool
+        
         Returns:
-            (target_pos, target_quat, status, is_origin_cmd)
-            target_quat: np.array [x,y,z,w] — None nếu chưa set origin
+            (target_pose, status_msg, is_origin_command)
         """
-        # Lưu để _set_origin dùng
-        self._robot_current_quat = robot_current_quat
-
-        # AUTO-ORIGIN (kiểu Pika): pose đầu tiên ổn định tự làm origin
-        # Đợi 30 frames stable (~0.3s @ 100Hz) để tránh dùng pose lúc tracker chưa hội tụ
-        if not self.origin_set:
-            if not hasattr(self, "_frame_count"):
-                self._frame_count = 0
-            self._frame_count += 1
-            if self._frame_count >= 30:
-                self.logger.info("🎯 AUTO-ORIGIN triggered after stable tracking")
-                target_pos, target_quat = self._set_origin(
-                    tracker_pose_matrix, robot_current_pose,
-                    workspace_check=workspace_check,
-                    robot_current_quat=robot_current_quat)
-                if target_pos is not None:
-                    return target_pos, target_quat, "Auto-origin set", True
-                return None, None, "Auto-origin: tracker outside workspace", False
+        # Phát hiện nhấn Home (edge detection)
         home_just_pressed = self.home_pressed and not self.last_home_state
         self.last_home_state = self.home_pressed
-
+        
+        # Nếu nhấn Home → Set origin
         if home_just_pressed:
-            target_pos, target_quat = self._set_origin(
-                tracker_pose_matrix, robot_current_pose,
-                workspace_check=workspace_check,
-                robot_current_quat=getattr(self, '_robot_current_quat', None))
-            if target_pos is not None:
-                return target_pos, target_quat, "Origin set - Moving robot", True
+            target = self._set_origin(
+                tracker_pose_matrix, 
+                robot_current_pose,
+                workspace_check=workspace_check
+            )
+            if target is not None:
+                return target, "Origin set - Moving robot", True
             else:
-                return None, None, "Origin set - Robot stays", False
-
+                return None, "Origin set - Robot stays", False
+        
+        # Nếu chưa set origin
         if not self.origin_set:
-            return None, None, "Press Home to set origin", False
-
-        target_pos, target_quat = self._calculate_target(tracker_pose_matrix)
-        return target_pos, target_quat, "Active", False
-
-    def _set_origin(self, tracker_pose_matrix, robot_current_pose, workspace_check=None, robot_current_quat=None):
+            return None, "Press Home to set origin", False
+        
+        # Tính target (luôn active sau khi set origin)
+        target = self._calculate_target(tracker_pose_matrix)
+        return target, "Active", False
+    
+    def _set_origin(self, tracker_pose_matrix, robot_current_pose, workspace_check=None):
+        """Set origin position"""
         tracker_pos = tracker_pose_matrix[:3, 3].copy()
-        is_safe = workspace_check(tracker_pos) if workspace_check is not None else True
-
-        # Lưu Vive orientation tại Home để tính delta
-        self.origin_rot = R.from_matrix(tracker_pose_matrix[:3, :3])
-
-        # TCP base orientation = orientation HIỆN TẠI của TCP (không snap top-down)
-        # → marker tại Home trùng khít với TCP ngay lập tức
-        if robot_current_quat is not None:
-            self.tcp_origin_rot = R.from_quat(robot_current_quat)
-            current_quat = robot_current_quat.copy()
+        
+        # Kiểm tra workspace
+        if workspace_check is not None:
+            is_safe = workspace_check(tracker_pos)
         else:
-            self.tcp_origin_rot = R.from_quat(TOP_DOWN_QUAT)
-            current_quat = TOP_DOWN_QUAT.copy()
-
+            is_safe = True
+        
         if is_safe:
+            # AN TOÀN → Di chuyển robot đến vị trí tracker
             self.tracker_origin = tracker_pos
-            self.robot_origin   = tracker_pos
-            self.origin_set     = True
-            self.logger.info("📍 [Home] Marker = TCP current orientation")
-            self.logger.info(f"   TRACKER: X={tracker_pos[0]:.4f}, Y={tracker_pos[1]:.4f}, Z={tracker_pos[2]:.4f}")
-            return tracker_pos, current_quat
+            self.robot_origin = tracker_pos
+            self.origin_set = True
+            
+            self.logger.info("📍 [Home] Origin set + Robot moving to tracker:")
+            self.logger.info(f"   >>> TRACKER COORDS: X={tracker_pos[0]:.4f}, Y={tracker_pos[1]:.4f}, Z={tracker_pos[2]:.4f}")
+            self.logger.info(f"   Target: {tracker_pos}")
+            
+            return tracker_pos
         else:
+            # NGOÀI WORKSPACE → Chỉ lưu origin
             self.tracker_origin = tracker_pos
-            self.robot_origin   = robot_current_pose.copy()
-            self.origin_set     = True
+            self.robot_origin = robot_current_pose.copy()
+            self.origin_set = True
+            
             self.logger.warn("⚠️ [Home] Tracker outside workspace!")
-            self.logger.info(f"   TRACKER (UNSAFE): X={tracker_pos[0]:.4f}, Y={tracker_pos[1]:.4f}, Z={tracker_pos[2]:.4f}")
-            return None, None
-
+            self.logger.info(f"   >>> TRACKER (UNSAFE): X={tracker_pos[0]:.4f}, Y={tracker_pos[1]:.4f}, Z={tracker_pos[2]:.4f}")
+            self.logger.info("📍 Origin set (robot stays at current position)")
+            
+            return None
+    
     def _calculate_target(self, tracker_current_matrix):
-        """
-        Position: follow Vive delta from Home.
-        Orientation: TOP-DOWN base + FULL delta rotation từ Vive (roll, pitch, yaw).
-        """
+        """Tính vị trí target từ delta"""
         tracker_current = tracker_current_matrix[:3, 3]
-        delta      = tracker_current - self.tracker_origin
-        target_pos = self.robot_origin + delta
-
-        # Full delta rotation từ lúc Home
-        R_current   = R.from_matrix(tracker_current_matrix[:3, :3])
-        R_delta     = R_current * self.origin_rot.inv()
-        # Áp delta lên TOP_DOWN
-        R_tcp_target = R_delta * self.tcp_origin_rot
-        target_quat  = R_tcp_target.as_quat()
-
-        return target_pos, target_quat
-
+        delta = tracker_current - self.tracker_origin
+        target = self.robot_origin + delta
+        return target
+    
     def reset_origin(self):
+        """Reset origin"""
         self.origin_set = False
         self.logger.info("🔄 Origin reset")
-
+    
     def shutdown(self):
+        """Cleanup"""
         self.listener.stop()
-
 
 # -------------------------------------------------------
 
@@ -181,31 +169,43 @@ class ViveMarkerPub(Node):
         super().__init__('vive_ur5_teleop')
         self._declare_parameters()
         self.cfg = self._load_config()
-
+        
         self.base_frame = self.cfg.get('frames', {}).get('base', 'base')
-        self.ee_frame   = self.cfg.get('frames', {}).get('ee', 'tool0')
+        self.ee_frame = self.cfg.get('frames', {}).get('ee', 'tool0')
 
-        self.tf_buffer   = Buffer()
+        self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.tf_broadcaster = TransformBroadcaster(self)
 
+        # self.gripper_state = 'close'
+        # self.last_trigger_state = 0
+
+        # ✅ THÊM: Load World Alignment Matrix
         self.world_alignment = None
         self.use_world_alignment = self.load_world_alignment()
 
+        # ✅ THÊM: Control Mode (absolute hoặc relative)
         self.control_mode = self.cfg.get('control_mode', 'relative')
-
+        
+        # ✅ THÊM: Relative Control (nếu cần)
         if self.control_mode == 'relative':
             self.rel_control = RelativeControlWithKeyboard(self.get_logger())
-            self.robot_current_pose = np.array([0.3, 0.2, 0.4])
-            self.robot_current_quat = TOP_DOWN_QUAT.copy()  # default
-
+            # Robot current pose (sẽ được cập nhật từ /ur_actual_pose)
+            self.robot_current_pose = np.array([0.3, 0.2, 0.4])  # Giá trị khởi tạo
+            
+            # Subscribe actual pose từ Node 4
             if Xyzrpy is not None:
                 self.actual_pose_sub = self.create_subscription(
-                    Xyzrpy, '/ur_actual_pose', self.actual_pose_callback, 10)
+                    Xyzrpy,
+                    '/ur_actual_pose',
+                    self.actual_pose_callback,
+                    10
+                )
                 self.get_logger().info("✅ Subscribed to /ur_actual_pose")
             else:
-                self.get_logger().warn("⚠️ Xyzrpy message not available")
-
+                self.get_logger().warn("⚠️ Xyzrpy message not available, using default pose")
+            
+            # Publisher cho lệnh di chuyển đến origin
             self.origin_cmd_pub = self.create_publisher(Pose, '/robot_origin_cmd', 10)
             self.get_logger().info("✅ Publisher /robot_origin_cmd created")
         else:
@@ -213,290 +213,410 @@ class ViveMarkerPub(Node):
             self.robot_current_pose = None
             self.origin_cmd_pub = None
 
-        self.ee_marker_pub  = self.create_publisher(Marker, 'vive_gripper', 10)
-        self.control_pub    = self.create_publisher(
-            PoseStamped, '/ur_target_pose', rclpy.qos.qos_profile_sensor_data)
-        self.robot_ws_pub   = self.create_publisher(Marker, '/robot_ws_marker', 10)
+        self.ee_marker_pub = self.create_publisher(Marker, 'vive_gripper', 10)
+        self.control_pub = self.create_publisher(PoseStamped, '/ur_target_pose', rclpy.qos.qos_profile_sensor_data)
+        self.robot_ws_pub = self.create_publisher(Marker, '/robot_ws_marker', 10)
 
         self.setup_markers()
 
-        # workspace_check tạo 1 lần
-        ws_cfg = self.cfg['robot_ws']
-        self._ws_center = [float(ws_cfg['x_mid']), float(ws_cfg['y_mid']), float(ws_cfg['z_mid'])]
-        self._ws_len    = [float(ws_cfg['x_len']), float(ws_cfg['y_len']), float(ws_cfg['z_len'])]
-
+        # 1. Cấu hình QoS Best Effort (Ưu tiên tốc độ, chấp nhận mất gói tin cũ)
         qos_best_effort = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=1
         )
-        self.pose_sub = self.create_subscription(
-            PoseStamped, '/right_controller_as_posestamped',
-            self.pose_callback, qos_best_effort)
 
+        # 2. Subscribe trực tiếp (Không qua Synchronizer, Không chờ Joy)
+        self.pose_sub = self.create_subscription(
+            PoseStamped, 
+            '/right_controller_as_posestamped', 
+            self.pose_callback,  # Lưu ý: Tên hàm callback đổi từ synced_callback -> pose_callback
+            qos_best_effort
+        )
+
+        # 3. Biến đếm để giảm tải hiển thị Workspace (Downsampling)
         self.viz_counter = 0
 
-        alignment_mode   = "WORLD ALIGNMENT" if self.use_world_alignment else "HARDCODED ROTATION"
+        alignment_mode = "WORLD ALIGNMENT" if self.use_world_alignment else "HARDCODED ROTATION"
         control_mode_str = f" + {self.control_mode.upper()} MODE"
         self.get_logger().info(f"######### INIT done - {alignment_mode}{control_mode_str} #########")
         self.get_logger().info(f"Base frame: {self.base_frame}")
 
-    # ------------------------------------------------------------------
     def load_world_alignment(self, filepath="world_alignment_matrix.txt"):
+        """
+        Load World Alignment Matrix từ file
+        
+        Returns:
+            bool: True nếu load thành công, False nếu fallback về hardcoded
+        """
         try:
             self.world_alignment = np.loadtxt(filepath)
+            
             if self.world_alignment.shape != (4, 4):
                 self.get_logger().error(f"❌ Invalid matrix shape: {self.world_alignment.shape}")
                 return False
+            
             self.get_logger().info(f"✅ Loaded World Alignment Matrix from {filepath}")
+            self.get_logger().info(f"Matrix:\n{self.world_alignment}")
             return True
+            
         except FileNotFoundError:
-            self.get_logger().warn(f"⚠️ {filepath} not found — fallback to hardcoded")
+            self.get_logger().warn(f"⚠️ File not found: {filepath}")
+            self.get_logger().warn("   Falling back to hardcoded rotation")
             return False
         except Exception as e:
             self.get_logger().error(f"❌ Error loading matrix: {e}")
             return False
 
     def _declare_parameters(self):
+        # Giá trị offset của Robot thật
         self.declare_parameter('manipulation.offsets_real.trans_x', 0.60)
         self.declare_parameter('manipulation.offsets_real.trans_y', 1.0)
         self.declare_parameter('manipulation.offsets_real.trans_z', 0.848)
         self.declare_parameter('manipulation.offsets_real.rot_x', 0.0)
         self.declare_parameter('manipulation.offsets_real.rot_y', 0.0)
-        self.declare_parameter('manipulation.offsets_real.rot_z', 0.0)
+        self.declare_parameter('manipulation.offsets_real.rot_z', 0.0)  # Fallback
+
+        # Giá trị offset của mô phỏng
         self.declare_parameter('manipulation.offsets_sim.trans_x', -0.2)
         self.declare_parameter('manipulation.offsets_sim.trans_y', 2.5)
         self.declare_parameter('manipulation.offsets_sim.trans_z', 1.65)
         self.declare_parameter('manipulation.offsets_sim.rot_x', 0.0)
         self.declare_parameter('manipulation.offsets_sim.rot_y', 0.0)
-        self.declare_parameter('manipulation.offsets_sim.rot_z', 95.5)
+        self.declare_parameter('manipulation.offsets_sim.rot_z', 95.5)  # Fallback
+        
+        # Workspace Cuboid
         self.declare_parameter('robot_ws.x_mid', -0.32)
         self.declare_parameter('robot_ws.x_len', 0.4)
         self.declare_parameter('robot_ws.y_mid', -0.005)
         self.declare_parameter('robot_ws.y_len', 0.4)
         self.declare_parameter('robot_ws.z_mid', 0.31)
         self.declare_parameter('robot_ws.z_len', 0.3)
+        
+        # Frames
         self.declare_parameter('frames.base', 'base')
         self.declare_parameter('frames.ee', 'tool0')
         self.declare_parameter('sim', 'true')
-        self.declare_parameter('control_mode', 'relative')
+        
+        # Control Mode Chọn chế độ tại đây
+        self.declare_parameter('control_mode', 'relative')  # 'absolute' hoặc 'relative'
 
     def _load_config(self):
-        return {
+        config = {
             'manipulation': {
-                'offsets_real': {k: self.get_parameter(f'manipulation.offsets_real.{k}').value
-                                 for k in ['trans_x','trans_y','trans_z','rot_x','rot_y','rot_z']},
-                'offsets_sim':  {k: self.get_parameter(f'manipulation.offsets_sim.{k}').value
-                                 for k in ['trans_x','trans_y','trans_z','rot_x','rot_y','rot_z']},
+                'offsets_real': {
+                    'trans_x': self.get_parameter('manipulation.offsets_real.trans_x').value,
+                    'trans_y': self.get_parameter('manipulation.offsets_real.trans_y').value,
+                    'trans_z': self.get_parameter('manipulation.offsets_real.trans_z').value,
+                    'rot_x': self.get_parameter('manipulation.offsets_real.rot_x').value,
+                    'rot_y': self.get_parameter('manipulation.offsets_real.rot_y').value,
+                    'rot_z': self.get_parameter('manipulation.offsets_real.rot_z').value,
+                },
+                'offsets_sim': {
+                    'trans_x': self.get_parameter('manipulation.offsets_sim.trans_x').value,
+                    'trans_y': self.get_parameter('manipulation.offsets_sim.trans_y').value,
+                    'trans_z': self.get_parameter('manipulation.offsets_sim.trans_z').value,
+                    'rot_x': self.get_parameter('manipulation.offsets_sim.rot_x').value,
+                    'rot_y': self.get_parameter('manipulation.offsets_sim.rot_y').value,
+                    'rot_z': self.get_parameter('manipulation.offsets_sim.rot_z').value,
+                }
             },
-            'robot_ws':     {k: self.get_parameter(f'robot_ws.{k}').value
-                             for k in ['x_mid','x_len','y_mid','y_len','z_mid','z_len']},
-            'frames':       {'base': self.get_parameter('frames.base').value,
-                             'ee':   self.get_parameter('frames.ee').value},
-            'sim':          self.get_parameter('sim').value,
-            'control_mode': self.get_parameter('control_mode').value,
+            'robot_ws': {
+                'x_mid': self.get_parameter('robot_ws.x_mid').value,
+                'x_len': self.get_parameter('robot_ws.x_len').value,
+                'y_mid': self.get_parameter('robot_ws.y_mid').value,
+                'y_len': self.get_parameter('robot_ws.y_len').value,
+                'z_mid': self.get_parameter('robot_ws.z_mid').value,
+                'z_len': self.get_parameter('robot_ws.z_len').value,
+            },
+            'frames': {
+                'base': self.get_parameter('frames.base').value,
+                'ee': self.get_parameter('frames.ee').value,
+            },
+            'sim': self.get_parameter('sim').value,
+            'control_mode': self.get_parameter('control_mode').value
         }
+        return config
 
     def setup_markers(self):
-        mesh_path = "file:///home/khanh/ur5_teleop_vive/ur5_teleop_vive/mesh/hand.dae"
+        mesh_path = "file:///home/xuanlinh/Desktop/Sample/UR5_VR_teleop-master/ur5_teleop_vive/mesh/hand.dae"
         self.ee_marker = self.create_ee_marker(mesh_path, [0.0, 1.0, 0.0, 0.6])
-
+        
         self.robot_ws_marker = Marker()
         self.robot_ws_marker.header.frame_id = self.base_frame
-        self.robot_ws_marker.type  = Marker.CUBE
+        self.robot_ws_marker.type = Marker.CUBE
         self.robot_ws_marker.action = Marker.ADD
         self.robot_ws_marker.pose.orientation.w = 1.0
-        self.robot_ws_marker.color.r = 0.0
-        self.robot_ws_marker.color.g = 1.0
-        self.robot_ws_marker.color.b = 0.0
-        self.robot_ws_marker.color.a = 0.3
-        ws = self.cfg['robot_ws']
-        self.robot_ws_marker.pose.position.x = float(ws['x_mid'])
-        self.robot_ws_marker.pose.position.y = float(ws['y_mid'])
-        self.robot_ws_marker.pose.position.z = float(ws['z_mid'])
-        self.robot_ws_marker.scale.x = float(ws['x_len'])
-        self.robot_ws_marker.scale.y = float(ws['y_len'])
-        self.robot_ws_marker.scale.z = float(ws['z_len'])
+        self.robot_ws_marker.color.r = 0.0; self.robot_ws_marker.color.g = 1.0; self.robot_ws_marker.color.b = 0.0; self.robot_ws_marker.color.a = 0.3
+        
+        ws_cfg = self.cfg['robot_ws']
+        self.robot_ws_marker.pose.position.x = float(ws_cfg['x_mid'])
+        self.robot_ws_marker.pose.position.y = float(ws_cfg['y_mid'])
+        self.robot_ws_marker.pose.position.z = float(ws_cfg['z_mid'])
+        self.robot_ws_marker.scale.x = float(ws_cfg['x_len'])
+        self.robot_ws_marker.scale.y = float(ws_cfg['y_len'])
+        self.robot_ws_marker.scale.z = float(ws_cfg['z_len'])
 
     def create_ee_marker(self, mesh_resource, color):
         marker = Marker()
         marker.header.frame_id = self.base_frame
-        marker.ns = "robot"; marker.id = 0
+        marker.ns = "robot"
+        marker.id = 0
         marker.type = Marker.MESH_RESOURCE
         marker.mesh_resource = mesh_resource
         marker.action = Marker.ADD
         marker.scale.x = 1.0; marker.scale.y = 1.0; marker.scale.z = 1.0
-        marker.color.r = color[0]; marker.color.g = color[1]
-        marker.color.b = color[2]; marker.color.a = color[3]
+        marker.color.r = color[0]; marker.color.g = color[1]; marker.color.b = color[2]; marker.color.a = color[3]
         return marker
 
-    def is_point_inside_cuboid(self, point, center, lengths):
-        return all(abs(point[i] - center[i]) <= lengths[i] / 2 for i in range(3))
-
-    # ------------------------------------------------------------------
-    # apply_world_alignment — đầy đủ BƯỚC 1-4
     def apply_world_alignment(self, pose_msg):
+        """
+        Áp dụng World Alignment Matrix
+        - Chỉ xoay trục Z để đồng bộ hướng
+        - KHÔNG có offset translation trong ma trận
+        """
         p = copy.deepcopy(pose_msg)
+        
+        # Lấy offset translation
+        if self.cfg.get('sim') == 'true':
+            offsets = self.cfg['manipulation']['offsets_sim']
+        else:
+            offsets = self.cfg['manipulation']['offsets_real']
 
-        # BƯỚC 1-3: Transform position
-        pos_h = np.array([pose_msg.position.x, pose_msg.position.y,
-                          pose_msg.position.z, 1.0])
-        pos_r = self.world_alignment @ pos_h
-        p.position.x = float(pos_r[0])
-        p.position.y = float(pos_r[1])
-        p.position.z = float(pos_r[2])
+        # --- BƯỚC 1: Lấy vị trí VR (đảo trục) ---
+        vr_pos = np.array([
+            -pose_msg.position.x,  # Đảo X
+            -pose_msg.position.y,  # Đảo Y
+            pose_msg.position.z,   # Giữ nguyên Z
+            1.0  # Homogeneous coordinate
+        ])
 
-        # BƯỚC 4: Transform orientation
-        q_vr      = [pose_msg.orientation.x, pose_msg.orientation.y,
-                     pose_msg.orientation.z, pose_msg.orientation.w]
-        rot_final = R.from_matrix(self.world_alignment[:3, :3]) * R.from_quat(q_vr)
-        q_f = rot_final.as_quat()
-        p.orientation.x = float(q_f[0]); p.orientation.y = float(q_f[1])
-        p.orientation.z = float(q_f[2]); p.orientation.w = float(q_f[3])
+        # --- BƯỚC 2: Áp dụng World Alignment Matrix ---
+        aligned_pos = self.world_alignment @ vr_pos
+
+        # --- BƯỚC 3: Cộng offset translation ---
+        p.position.x = aligned_pos[0] + float(offsets['trans_x'])
+        p.position.y = aligned_pos[1] + float(offsets['trans_y'])
+        p.position.z = aligned_pos[2] + float(offsets['trans_z'])
+
+        # --- BƯỚC 4: Khóa orientation (top-down) ---
+        p.orientation.x = 1.0
+        p.orientation.y = 0.0
+        p.orientation.z = 0.0
+        p.orientation.w = 0.0
+
         return p
 
+    #Hàm offset cứng
     def apply_offset_hardcoded(self, pose_msg):
+        """
+        Fallback: Hardcoded rotation matrix (CŨ)
+        Dùng khi không có world_alignment_matrix.txt
+        """
         p = copy.deepcopy(pose_msg)
-        offsets = self.cfg['manipulation']['offsets_sim' if self.cfg.get('sim') == 'true' else 'offsets_real']
+        
+        # Lấy offset từ config
+        if self.cfg.get('sim') == 'true':
+            offsets = self.cfg['manipulation']['offsets_sim']
+        else:
+            offsets = self.cfg['manipulation']['offsets_real']
+
+        # --- BƯỚC 1: Lấy tọa độ thô từ VR (Có đảo trục để khớp hướng chung) ---
         vr_x = -pose_msg.position.x
         vr_y = -pose_msg.position.y
-        vr_z =  pose_msg.position.z
+        vr_z = pose_msg.position.z
+
+        # --- BƯỚC 2: Tính toán Xoay (Rotation Matrix) ---
+        # Lấy góc xoay rot_z (độ) đổi sang radian
         theta = np.deg2rad(float(offsets['rot_z']))
-        p.position.x = vr_x * math.cos(theta) - vr_y * math.sin(theta) + float(offsets['trans_x'])
-        p.position.y = vr_x * math.sin(theta) + vr_y * math.cos(theta) + float(offsets['trans_y'])
+
+        # Công thức xoay vector 2D:
+        # x' = x*cos(theta) - y*sin(theta)
+        # y' = x*sin(theta) + y*cos(theta)
+        rotated_x = vr_x * math.cos(theta) - vr_y * math.sin(theta)
+        rotated_y = vr_x * math.sin(theta) + vr_y * math.cos(theta)
+
+        # --- BƯỚC 3: Cộng Offset vị trí (Translation) ---
+        p.position.x = rotated_x + float(offsets['trans_x'])
+        p.position.y = rotated_y + float(offsets['trans_y'])
         p.position.z = vr_z + float(offsets['trans_z'])
-        p.orientation.x = 1.0; p.orientation.y = 0.0
-        p.orientation.z = 0.0; p.orientation.w = 0.0
+
+        # --- BƯỚC 4: Khóa hướng tay gắp (Top-down) ---
+        p.orientation.x = 1.0
+        p.orientation.y = 0.0
+        p.orientation.z = 0.0
+        p.orientation.w = 0.0
+
         return p
 
     def apply_offset(self, pose_msg):
-        return self.apply_world_alignment(pose_msg) if self.use_world_alignment \
-               else self.apply_offset_hardcoded(pose_msg)
+        """
+        Wrapper: Tự động chọn World Alignment hoặc Hardcoded
+        """
+        if self.use_world_alignment:
+            return self.apply_world_alignment(pose_msg)
+        else:
+            return self.apply_offset_hardcoded(pose_msg)
 
     def actual_pose_callback(self, msg):
+        """Nhận vị trí thật từ Node 4 (/ur_actual_pose)"""
         if self.control_mode == 'relative':
             self.robot_current_pose = np.array([msg.x, msg.y, msg.z])
-            # Lưu orientation hiện tại của TCP (rotvec → quaternion)
-            try:
-                rotvec = np.array([msg.roll, msg.pitch, msg.yaw])
-                self.robot_current_quat = R.from_rotvec(rotvec).as_quat()
-            except Exception:
-                self.robot_current_quat = TOP_DOWN_QUAT.copy()
 
     def pose_to_matrix(self, pose):
+        """Chuyển Pose → Matrix 4x4"""
+        t = np.array([pose.position.x, pose.position.y, pose.position.z])
+        q = [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w]
+        rot_matrix = R.from_quat(q).as_matrix()  
         T = np.eye(4)
-        T[:3, :3] = R.from_quat([pose.orientation.x, pose.orientation.y,
-                                  pose.orientation.z, pose.orientation.w]).as_matrix()
-        T[:3, 3] = [pose.position.x, pose.position.y, pose.position.z]
+        T[:3, :3] = rot_matrix
+        T[:3, 3] = t
         return T
 
-    # ------------------------------------------------------------------
+    def is_point_inside_cuboid(self, point, center, lengths):
+        x, y, z = point
+        x_center, y_center, z_center = center
+        length_x, length_y, length_z = lengths
+        return (abs(x - x_center) <= length_x / 2) and \
+               (abs(y - y_center) <= length_y / 2) and \
+               (abs(z - z_center) <= length_z / 2)
+
     def pose_callback(self, pose_msg):
+        # 2. Chọn chế độ điều khiển
         if self.control_mode == 'relative':
-            tracker_matrix = self.pose_to_matrix(pose_msg.pose)
+            # ========== RELATIVE MODE ==========
+            # Chuyển pose → matrix
+            tracker_pose_matrix = self.pose_to_matrix(pose_msg.pose)
+            
+            # Áp dụng World Alignment (nếu có)
             if self.use_world_alignment:
-                tracker_matrix = self.world_alignment @ tracker_matrix
-
-            def workspace_check(pt):
-                return self.is_point_inside_cuboid(pt, self._ws_center, self._ws_len)
-
-            target_pos, target_quat, status, is_origin_cmd = self.rel_control.update(
-                tracker_matrix, self.robot_current_pose,
-                workspace_check=workspace_check,
-                robot_current_quat=self.robot_current_quat)
-
-            # Log: chỉ khi có sự kiện hoặc throttle 1Hz
-            if is_origin_cmd:
-                self.get_logger().info(f"Status: {status} | target={target_pos}")
-            else:
-                self.get_logger().info(f"Status: {status}", throttle_duration_sec=1.0)
-
-            if target_pos is not None:
+                tracker_pose_matrix = self.world_alignment @ tracker_pose_matrix
+            
+            # Tạo workspace check function
+            ws_cfg = self.cfg['robot_ws']
+            ws_center = [float(ws_cfg['x_mid']), float(ws_cfg['y_mid']), float(ws_cfg['z_mid'])]
+            ws_len = [float(ws_cfg['x_len']), float(ws_cfg['y_len']), float(ws_cfg['z_len'])]
+            
+            def workspace_check(point):
+                return self.is_point_inside_cuboid(point, ws_center, ws_len)
+            
+            # Update relative control
+            target, status, is_origin_cmd = self.rel_control.update(
+                tracker_pose_matrix,
+                self.robot_current_pose,
+                workspace_check=workspace_check
+            )
+            
+            # Xử lý target
+            if target is not None:
+                # Tạo marker pose
                 marker_pose = Pose()
-                marker_pose.position.x = float(target_pos[0])
-                marker_pose.position.y = float(target_pos[1])
-                marker_pose.position.z = float(target_pos[2])
-                # Gán orientation thật từ tracker (hoặc top-down nếu vừa Home)
-                marker_pose.orientation.x = float(target_quat[0])
-                marker_pose.orientation.y = float(target_quat[1])
-                marker_pose.orientation.z = float(target_quat[2])
-                marker_pose.orientation.w = float(target_quat[3])
-
-                if workspace_check(target_pos):
+                marker_pose.position.x = float(target[0])
+                marker_pose.position.y = float(target[1])
+                marker_pose.position.z = float(target[2])
+                marker_pose.orientation.x = 1.0
+                marker_pose.orientation.y = 0.0
+                marker_pose.orientation.z = 0.0
+                marker_pose.orientation.w = 0.0
+                
+                # Kiểm tra workspace
+                if workspace_check(target):
                     marker_color = [0.0, 1.0, 0.0]  # Green
+                    
+                    # Nếu là lệnh set origin → Publish lệnh di chuyển
                     if is_origin_cmd:
-                        self.get_logger().info(f"🤖 [ORIGIN CMD] {target_pos}")
+                        self.get_logger().info(f"🤖 [ORIGIN CMD] Publishing move command: {target}")
+                        
+                        # Tạo Pose message cho Node 4
                         origin_cmd = Pose()
-                        origin_cmd.position.x = float(target_pos[0])
-                        origin_cmd.position.y = float(target_pos[1])
-                        origin_cmd.position.z = float(target_pos[2])
-                        # Origin cmd: giữ nguyên orientation TCP hiện tại
-                        origin_cmd.orientation.x = float(target_quat[0])
-                        origin_cmd.orientation.y = float(target_quat[1])
-                        origin_cmd.orientation.z = float(target_quat[2])
-                        origin_cmd.orientation.w = float(target_quat[3])
+                        origin_cmd.position.x = float(target[0])
+                        origin_cmd.position.y = float(target[1])
+                        origin_cmd.position.z = float(target[2])
+                        origin_cmd.orientation.x = 1.0
+                        origin_cmd.orientation.y = 0.0
+                        origin_cmd.orientation.z = 0.0
+                        origin_cmd.orientation.w = 0.0
+                        
+                        # Publish lệnh
                         self.origin_cmd_pub.publish(origin_cmd)
-                        self.robot_current_pose = target_pos
+                        
+                        # Cập nhật robot_current_pose (sẽ được cập nhật lại từ /ur_actual_pose)
+                        self.robot_current_pose = target
                 else:
                     marker_color = [1.0, 0.0, 0.0]  # Red
             else:
+                # Không có target → Hiển thị vị trí hiện tại
                 marker_pose = Pose()
                 marker_pose.position.x = float(self.robot_current_pose[0])
                 marker_pose.position.y = float(self.robot_current_pose[1])
                 marker_pose.position.z = float(self.robot_current_pose[2])
-                marker_pose.orientation.x = float(TOP_DOWN_QUAT[0])
-                marker_pose.orientation.y = float(TOP_DOWN_QUAT[1])
-                marker_pose.orientation.z = float(TOP_DOWN_QUAT[2])
-                marker_pose.orientation.w = float(TOP_DOWN_QUAT[3])
+                marker_pose.orientation.x = 1.0
+                marker_pose.orientation.y = 0.0
+                marker_pose.orientation.z = 0.0
+                marker_pose.orientation.w = 0.0
                 marker_color = [0.5, 0.5, 0.5]  # Gray
-
+        
         else:
-            # ABSOLUTE MODE
-            processed = self.apply_offset(pose_msg.pose)
-            marker_pose = processed
-            pt = [marker_pose.position.x, marker_pose.position.y, marker_pose.position.z]
-            marker_color = [0.0, 1.0, 0.0] if self.is_point_inside_cuboid(
-                pt, self._ws_center, self._ws_len) else [1.0, 0.0, 0.0]
+            # ========== ABSOLUTE MODE ==========
+            # Process Pose (dùng code cũ)
+            processed_pose = self.apply_offset(pose_msg.pose)
+            marker_pose = processed_pose
+            
+            # Check Workspace
+            point = [marker_pose.position.x, marker_pose.position.y, marker_pose.position.z]
+            ws_cfg = self.cfg['robot_ws']
+            ws_center = [float(ws_cfg['x_mid']), float(ws_cfg['y_mid']), float(ws_cfg['z_mid'])]
+            ws_len = [float(ws_cfg['x_len']), float(ws_cfg['y_len']), float(ws_cfg['z_len'])]
 
-        # Publish — dùng chung 1 timestamp
-        now = self.get_clock().now().to_msg()
-
+            if self.is_point_inside_cuboid(point, ws_center, ws_len):
+                marker_color = [0.0, 1.0, 0.0]  # Green
+            else:
+                marker_color = [1.0, 0.0, 0.0]  # Red
+        
+        # 3. Update Marker (chung cho cả 2 chế độ)
         self.ee_marker.pose = marker_pose
-        self.ee_marker.header.stamp = now
+        self.ee_marker.header.stamp = self.get_clock().now().to_msg()
         self.ee_marker.header.frame_id = self.base_frame
         self.ee_marker.color.r = marker_color[0]
         self.ee_marker.color.g = marker_color[1]
         self.ee_marker.color.b = marker_color[2]
+
+        # 4. Publish (ĐÃ TỐI ƯU)
+        
+        # A. Hand Marker: Gửi luôn (Real-time) để nhìn mượt
+        self.ee_marker.header.stamp = self.get_clock().now().to_msg()
         self.ee_marker_pub.publish(self.ee_marker)
 
         control_msg = PoseStamped()
-        control_msg.header.stamp = now
+        control_msg.header.stamp = self.get_clock().now().to_msg()
         control_msg.header.frame_id = self.base_frame
-        control_msg.pose = marker_pose
+        control_msg.pose = marker_pose  # Sử dụng lại biến marker_pose đã tính toán ở trên
         self.control_pub.publish(control_msg)
-
+        
+        # TF cũng gửi luôn (đi kèm Hand)
         t = TransformStamped()
-        t.header.stamp = now
+        t.header.stamp = self.get_clock().now().to_msg()
         t.header.frame_id = self.base_frame
         t.child_frame_id = "marker"
-        t.transform.translation.x = marker_pose.position.x
-        t.transform.translation.y = marker_pose.position.y
-        t.transform.translation.z = marker_pose.position.z
-        t.transform.rotation = marker_pose.orientation
+        t.transform.translation.x = self.ee_marker.pose.position.x
+        t.transform.translation.y = self.ee_marker.pose.position.y
+        t.transform.translation.z = self.ee_marker.pose.position.z
+        t.transform.rotation = self.ee_marker.pose.orientation
         self.tf_broadcaster.sendTransform(t)
 
+        # B. Workspace Marker: Chỉ gửi 1 lần mỗi 50 frame (Giảm tải băng thông)
         self.viz_counter += 1
         if self.viz_counter % 50 == 0:
-            self.robot_ws_marker.header.stamp = now
+            self.robot_ws_marker.header.stamp = self.get_clock().now().to_msg()
             self.robot_ws_pub.publish(self.robot_ws_marker)
-            if self.viz_counter > 10000:
-                self.viz_counter = 0
+            # Reset counter để tránh số quá lớn
+            if self.viz_counter > 10000: self.viz_counter = 0
 
     def destroy_node(self):
+        """Cleanup khi tắt node"""
         if self.rel_control is not None:
             self.rel_control.shutdown()
         super().destroy_node()
-
 
 def main(args=None):
     rclpy.init(args=args)
@@ -508,7 +628,6 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()

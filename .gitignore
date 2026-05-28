@@ -26,3 +26,6 @@ browse.vc.db
 
 # OS
 .DS_Store
+
+# Backup files
+*.bak
