@@ -128,8 +128,9 @@ def check_dataset(hdf5_path, show_demo=None, save_images=False):
         if "state" in obs:
             arr = np.asarray(obs["state"])
             print(f"  {ok(f'obs/state:       {arr.shape}  dtype={arr.dtype}')}")
-            print(f"       joints: {arr[0, :6].round(3).tolist()}")
-            print(f"       gripper: {arr[0, 6]:.3f}")
+            print(f"       TCP xyz: {arr[0, :3].round(3).tolist()} m")
+            print(f"       quat:    {arr[0, 3:7].round(3).tolist()}")
+            print(f"       gripper: {arr[0, 7]:.3f}")
         else:
             print(f"  {err('obs/state: MISSING')}")
 
@@ -156,37 +157,36 @@ def check_dataset(hdf5_path, show_demo=None, save_images=False):
         else:
             print(f"  {warn('obs/tactile_state: không có (OK nếu không dùng)')}")
 
-        # ── Check action sanity ──
+        # ── Check action sanity (schema berkeley: 7 dim delta) ──
         print(f"\n{BOLD}── Action sanity check ──────────────────────{RESET}")
         actions = np.asarray(grp0["actions"])
-        xyz  = actions[:, :3]
-        quat = actions[:, 3:7]
-        grip = actions[:, 7]
+        dxyz = actions[:, :3]    # delta x, y, z
+        drpy = actions[:, 3:6]   # delta roll, pitch, yaw
+        grip = actions[:, 6]     # gripper (index 6, không phải 7)
 
-        # XYZ range check
-        xyz_range = xyz.max(axis=0) - xyz.min(axis=0)
-        print(f"  XYZ range: {xyz_range.round(4).tolist()} m")
-        if xyz_range.max() < 0.001:
-            print(f"  {err('XYZ không thay đổi — robot không di chuyển?')}")
-        elif xyz_range.max() > 0.5:
-            print(f"  {warn('XYZ range lớn > 0.5m — kiểm tra lại')}")
+        # Delta XYZ range check
+        dxyz_total = np.abs(dxyz).sum(axis=0)   # tổng quãng đường mỗi trục
+        print(f"  Delta XYZ tổng: {dxyz_total.round(4).tolist()} m")
+        if dxyz_total.max() < 0.001:
+            print(f"  {err('Delta XYZ ~0 — robot không di chuyển?')}")
+        elif dxyz_total.max() > 5.0:
+            print(f"  {warn('Delta XYZ tổng lớn — kiểm tra lại')}")
         else:
-            print(f"  {ok('XYZ movement OK')}")
+            print(f"  {ok('Robot có di chuyển (delta Cartesian)')}")
 
-        # Quaternion norm check
-        quat_norms = np.linalg.norm(quat, axis=1)
-        if np.allclose(quat_norms, 1.0, atol=0.1):
-            print(f"  {ok('Quaternion norm OK (≈1.0)')}")
-        else:
-            print(f"  {warn(f'Quaternion norm: min={quat_norms.min():.3f} max={quat_norms.max():.3f}')}")
+        # Delta RPY range
+        drpy_total = np.abs(drpy).sum(axis=0)
+        print(f"  Delta RPY tổng: {drpy_total.round(4).tolist()} rad")
 
         # Gripper range
         print(f"  Gripper: min={grip.min():.3f}  max={grip.max():.3f}  "
-              f"(0=mở, 1=đóng)")
+              f"(0=mở, 1=kẹp)")
         if grip.max() < 0.1:
             print(f"  {warn('Gripper không đóng — có thu episode gắp vật không?')}")
+        elif grip.max() < 0.7:
+            print(f"  {warn(f'Gripper max chỉ {grip.max():.2f} — vô lăng chưa kẹp hết?')}")
         else:
-            print(f"  {ok('Gripper có đóng mở')}")
+            print(f"  {ok('Gripper có đóng mở đầy đủ')}")
 
         # ── Visualize ảnh nếu yêu cầu ──
         if show_demo is not None:
