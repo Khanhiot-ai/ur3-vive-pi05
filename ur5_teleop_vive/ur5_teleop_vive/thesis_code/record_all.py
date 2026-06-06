@@ -10,10 +10,11 @@ Schema HDF5 (giống lerobot/berkeley_autolab_ur5):
         │   ├── obs/
         │   │   ├── image         (T, 480, 640, 3) uint8   ← Realsense front
         │   │   ├── wrist_image   (T, 480, 640, 3) uint8   ← Realsense wrist
-        │   │   ├── state         (T, 8)  float32
-        │   │   │     [ee_x, ee_y, ee_z, qx, qy, qz, qw, gripper]
-        │   │   │     ← Cartesian TCP pose + gripper norm
-        │   │   └── tactile_state (T, 1)  float32          ← gripper torque
+        │   │   ├── digit_left     (T, 240, 320, 3) uint8   ← DIGIT tactile trái
+        │   │   ├── digit_right    (T, 240, 320, 3) uint8   ← DIGIT tactile phải
+        │   │   └── state         (T, 8)  float32
+        │   │         [ee_x, ee_y, ee_z, qx, qy, qz, qw, gripper]
+        │   │         ← Cartesian TCP pose + gripper norm
         │   ├── actions           (T, 7)  float32
         │   │     [dx, dy, dz, d_roll, d_pitch, d_yaw, gripper]
         │   │     ← DELTA Cartesian + gripper norm
@@ -41,6 +42,7 @@ from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, JointState
 from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Bool
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'xcb')
 
@@ -65,7 +67,10 @@ STATE_DIM    = 8
 # Action: [dx, dy, dz, d_roll, d_pitch, d_yaw, gripper] — delta Cartesian
 ACTION_DIM   = 7
 
-TACTILE_DIM  = 1   # gripper torque
+# DIGIT tactile images @60Hz — PORTRAIT (320 cao × 240 rộng)
+# Publisher đã xoay 90° ra portrait → recorder lưu NGUYÊN XI, KHÔNG resize.
+# V-JEPA cần cửa sổ 4 frame @60fps ở (H=320, W=240) RGB.
+DIGIT_SHAPE  = (320, 240, 3)   # (H, W, C) portrait — shape trong HDF5
 
 TOPIC_FRONT   = '/camera_front/camera/color/image_raw'
 TOPIC_WRIST   = '/camera_wrist/camera/color/image_raw'
@@ -73,6 +78,8 @@ TOPIC_JOINTS  = '/ur_joint_states'
 TOPIC_ACTUAL  = '/ur_actual_pose'      # Xyzrpy: x,y,z,roll,pitch,yaw
 TOPIC_TARGET  = '/ur_target_pose'      # PoseStamped: xyz + quat
 TOPIC_GRIPPER = '/gripper/state'
+TOPIC_DIGIT_L = '/digit_left/image_raw'    # DIGIT ngón trái
+TOPIC_DIGIT_R = '/digit_right/image_raw'   # DIGIT ngón phải
 # ════════════════════════════════════════════════════════
 
 
@@ -88,14 +95,15 @@ class HDF5Recorder(Node):
         self._lock       = threading.Lock()
         self.front_img   = None
         self.wrist_img   = None
+        self.digit_l_img = None
+        self.digit_r_img = None
         self.actual_pose = None   # dict: x,y,z,roll,pitch,yaw
         self.target_pose = None   # dict: x,y,z,qx,qy,qz,qw
         self.gripper     = None   # dict: pos_norm, torque, contact, mode
         self.front_count = 0
         self.wrist_count = 0
-
-        # ── Prev actual pose để tính delta ──
-        self._prev_actual = None
+        self.digit_l_count = 0
+        self.digit_r_count = 0
 
         # Recording buffers
         self.recording   = False
@@ -103,9 +111,14 @@ class HDF5Recorder(Node):
         self.t_start     = 0.0
         self.buf_front   = []
         self.buf_wrist   = []
+        self.buf_digit_l = []        # @60Hz (append trong callback)
+        self.buf_digit_r = []        # @60Hz
+        self.buf_digit_l_ts = []     # timestamp 60Hz cho digit trái
+        self.buf_digit_r_ts = []     # timestamp 60Hz cho digit phải
         self.buf_state   = []
-        self.buf_action  = []
-        self.buf_tactile = []
+        self.buf_tick_ts = []        # timestamp 20Hz mỗi tick
+        # Forward delta: lưu pose mỗi tick để tính action[t]=pose(t+1)-pose(t)
+        self.buf_pose    = []        # actual pose mỗi tick (cho forward delta)
 
         self.ep_total    = 0
         self.ep_success  = 0
@@ -126,10 +139,16 @@ class HDF5Recorder(Node):
         # ── Subscribers ──
         self.create_subscription(Image, TOPIC_FRONT, self._cb_front, qos_cam)
         self.create_subscription(Image, TOPIC_WRIST, self._cb_wrist, qos_cam)
+        self.create_subscription(Image, TOPIC_DIGIT_L, self._cb_digit_l, qos_cam)
+        self.create_subscription(Image, TOPIC_DIGIT_R, self._cb_digit_r, qos_cam)
         if HAS_XYZRPY:
             self.create_subscription(Xyzrpy,      TOPIC_ACTUAL,  self._cb_actual,  qos_robot)
         self.create_subscription(PoseStamped,      TOPIC_TARGET,  self._cb_target,  qos_robot)
         self.create_subscription(Float32MultiArray, TOPIC_GRIPPER, self._cb_gripper, qos_robot)
+
+        # ── Publishers điều khiển tự động ──
+        self.pub_teleop = self.create_publisher(Bool, '/teleop_enable', 10)
+        self.pub_home   = self.create_publisher(Bool, '/auto_home', 10)
 
         self.tick_timer = self.create_timer(self.dt, self._tick)
 
@@ -146,25 +165,41 @@ class HDF5Recorder(Node):
     # HDF5 init
     # ──────────────────────────────────────────────────────
     def _open_or_init_hdf5(self):
+        need_init = True
         if os.path.exists(self.h5_path):
-            with h5py.File(self.h5_path, "r") as f:
-                if "data" in f:
-                    nums = [int(k.split("_")[1]) for k in f["data"]
-                            if k.startswith("demo_")]
-                    self.next_demo_id = max(nums, default=-1) + 1
-                else:
-                    self.next_demo_id = 0
-        else:
-            with h5py.File(self.h5_path, "w") as f:
-                g = f.create_group("data")
-                g.attrs["task"]       = self.task
-                g.attrs["fps"]        = self.fps
-                g.attrs["state_dim"]  = STATE_DIM
-                g.attrs["action_dim"] = ACTION_DIM
-                g.attrs["image_shape"]= list(IMAGE_SHAPE)
-                g.attrs["robot"]      = "UR3"
-                g.attrs["state_keys"] = "ee_x,ee_y,ee_z,qx,qy,qz,qw,gripper"
-                g.attrs["action_keys"]= "dx,dy,dz,d_roll,d_pitch,d_yaw,gripper"
+            try:
+                with h5py.File(self.h5_path, "r") as f:
+                    if "data" in f:
+                        nums = [int(k.split("_")[1]) for k in f["data"]
+                                if k.startswith("demo_")]
+                        self.next_demo_id = max(nums, default=-1) + 1
+                        need_init = False
+                    else:
+                        # File tồn tại nhưng thiếu group 'data' → hỏng
+                        self.get_logger().warn(
+                            f"File {self.h5_path} thiếu group 'data' — tạo lại group.")
+            except Exception as e:
+                # File hỏng hoàn toàn → backup rồi tạo mới
+                self.get_logger().warn(f"File hỏng ({e}) — backup .corrupt rồi tạo mới.")
+                try:
+                    os.rename(self.h5_path, self.h5_path + ".corrupt")
+                except Exception:
+                    os.remove(self.h5_path)
+
+        if need_init:
+            # Tạo group 'data' (mode 'a' để không xóa demo cũ nếu file chỉ thiếu group)
+            mode = "a" if os.path.exists(self.h5_path) else "w"
+            with h5py.File(self.h5_path, mode) as f:
+                if "data" not in f:
+                    g = f.create_group("data")
+                    g.attrs["task"]       = self.task
+                    g.attrs["fps"]        = self.fps
+                    g.attrs["state_dim"]  = STATE_DIM
+                    g.attrs["action_dim"] = ACTION_DIM
+                    g.attrs["image_shape"]= list(IMAGE_SHAPE)
+                    g.attrs["robot"]      = "UR3"
+                    g.attrs["state_keys"] = "ee_x,ee_y,ee_z,qx,qy,qz,qw,gripper"
+                    g.attrs["action_keys"]= "dx,dy,dz,d_roll,d_pitch,d_yaw,gripper"
             self.next_demo_id = 0
 
     # ──────────────────────────────────────────────────────
@@ -187,6 +222,36 @@ class HDF5Recorder(Node):
                 self.wrist_count += 1
         except Exception as e:
             self.get_logger().warn(f"wrist: {e}", throttle_duration_sec=2.0)
+
+    def _cb_digit_l(self, msg):
+        try:
+            img = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+            # BGR→RGB, lưu nguyên xi (publisher đã ra portrait 320×240)
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            ts  = self.get_clock().now().nanoseconds * 1e-9
+            with self._lock:
+                self.digit_l_img = img        # cho GUI (BGR)
+                self.digit_l_count += 1
+                # DUAL-RATE: nếu đang record → append frame 60Hz vào buffer riêng
+                if self.recording:
+                    self.buf_digit_l.append(rgb)
+                    self.buf_digit_l_ts.append(ts)
+        except Exception as e:
+            self.get_logger().warn(f"digit_l: {e}", throttle_duration_sec=2.0)
+
+    def _cb_digit_r(self, msg):
+        try:
+            img = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            ts  = self.get_clock().now().nanoseconds * 1e-9
+            with self._lock:
+                self.digit_r_img = img        # cho GUI (BGR)
+                self.digit_r_count += 1
+                if self.recording:
+                    self.buf_digit_r.append(rgb)
+                    self.buf_digit_r_ts.append(ts)
+        except Exception as e:
+            self.get_logger().warn(f"digit_r: {e}", throttle_duration_sec=2.0)
 
     def _cb_actual(self, msg):
         """Nhận TCP pose thực tế (Xyzrpy): x,y,z,roll,pitch,yaw"""
@@ -240,24 +305,21 @@ class HDF5Recorder(Node):
             target  = dict(self.target_pose) if self.target_pose is not None else None
             gripper = dict(self.gripper)     if self.gripper     is not None else None
 
-        # Cần ít nhất 2 camera + actual pose để ghi
+        # Cần 2 camera + actual pose để ghi
         if f is None or w is None or actual is None:
             self.get_logger().warn(
                 "Thiếu data (cần front/wrist cam + actual pose)",
                 throttle_duration_sec=1.0)
             return
 
-        # ── Images → RGB 224×224 ──
+        # ── Images → RGB (480×640) ──
         front_rgb = cv2.cvtColor(cv2.resize(f, IMAGE_SIZE), cv2.COLOR_BGR2RGB)
         wrist_rgb = cv2.cvtColor(cv2.resize(w, IMAGE_SIZE), cv2.COLOR_BGR2RGB)
 
         # ── Gripper norm ──
         grip_norm = gripper["pos_norm"] if gripper else 0.0
 
-        # ── STATE (8 dim) ──
-        # [ee_x, ee_y, ee_z, qx, qy, qz, qw, gripper]
-        # Lấy quaternion từ target (vì actual_pose là Xyzrpy không có quat trực tiếp)
-        # Nếu target chưa có → dùng identity quat
+        # ── STATE (8 dim): [ee_x,ee_y,ee_z, qx,qy,qz,qw, gripper] ──
         if target is not None:
             qx, qy, qz, qw = (target["qx"], target["qy"],
                                target["qz"], target["qw"])
@@ -270,37 +332,22 @@ class HDF5Recorder(Node):
             grip_norm,
         ], dtype=np.float32)
 
-        # ── ACTION (7 dim) ──
-        # [dx, dy, dz, d_roll, d_pitch, d_yaw, gripper]
-        # delta = actual_current - actual_prev (robot đã di chuyển bao nhiêu)
-        if self._prev_actual is not None:
-            prev = self._prev_actual
-            action = np.array([
-                actual["x"]     - prev["x"],
-                actual["y"]     - prev["y"],
-                actual["z"]     - prev["z"],
-                actual["roll"]  - prev["roll"],
-                actual["pitch"] - prev["pitch"],
-                actual["yaw"]   - prev["yaw"],
-                grip_norm,
-            ], dtype=np.float32)
-        else:
-            # Frame đầu tiên: delta = 0
-            action = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, grip_norm],
-                               dtype=np.float32)
+        # ── FORWARD DELTA: lưu pose thô + gripper, action tính khi save ──
+        # action[t] = pose(t+1) - pose(t). Không tính ở đây vì cần frame sau.
+        pose_now = np.array([
+            actual["x"], actual["y"], actual["z"],
+            actual["roll"], actual["pitch"], actual["yaw"],
+            grip_norm,
+        ], dtype=np.float32)
 
-        # Cập nhật prev
-        self._prev_actual = dict(actual)
+        ts = self.get_clock().now().nanoseconds * 1e-9
 
-        # ── Tactile ──
-        tactile = np.array([gripper["torque"] if gripper else 0.0],
-                            dtype=np.float32)
-
-        self.buf_front.append(front_rgb)
-        self.buf_wrist.append(wrist_rgb)
-        self.buf_state.append(state)
-        self.buf_action.append(action)
-        self.buf_tactile.append(tactile)
+        with self._lock:
+            self.buf_front.append(front_rgb)
+            self.buf_wrist.append(wrist_rgb)
+            self.buf_state.append(state)
+            self.buf_pose.append(pose_now)
+            self.buf_tick_ts.append(ts)
         self.frame_idx += 1
 
     # ──────────────────────────────────────────────────────
@@ -316,120 +363,227 @@ class HDF5Recorder(Node):
             self.get_logger().warn("Chưa có actual_pose từ robot!")
             return
 
-        self.buf_front   = []
-        self.buf_wrist   = []
-        self.buf_state   = []
-        self.buf_action  = []
-        self.buf_tactile = []
-        self.frame_idx   = 0
+        with self._lock:
+            self.buf_front      = []
+            self.buf_wrist      = []
+            self.buf_digit_l    = []
+            self.buf_digit_r    = []
+            self.buf_digit_l_ts = []
+            self.buf_digit_r_ts = []
+            self.buf_state      = []
+            self.buf_pose       = []
+            self.buf_tick_ts    = []
+            self.frame_idx      = 0
+            self.recording      = True
         self.t_start     = time.time()
-        self._prev_actual = None   # Reset delta
-        self.recording   = True
         self.get_logger().info(f"🔴 START demo_{self.next_demo_id}")
 
     def stop_recording(self):
         self.recording = False
 
+    def teleop_on(self):
+        """Bật robot bám vive."""
+        m = Bool(); m.data = True
+        self.pub_teleop.publish(m)
+        self.get_logger().info("🟢 teleop ON (robot bám vive)")
+
+    def teleop_off(self):
+        """Tắt robot bám vive."""
+        m = Bool(); m.data = False
+        self.pub_teleop.publish(m)
+        self.get_logger().info("🔴 teleop OFF")
+
+    def go_home(self):
+        """Ra lệnh robot về home."""
+        m = Bool(); m.data = True
+        self.pub_home.publish(m)
+        self.get_logger().info("🏠 lệnh về home đã gửi")
+
     def save_episode(self, success):
-        if not self.buf_state:
+        # Snapshot buffer dưới lock (callback DIGIT vẫn chạy)
+        with self._lock:
+            self.recording = False   # dừng append DIGIT trước khi snapshot
+            buf_front   = list(self.buf_front)
+            buf_wrist   = list(self.buf_wrist)
+            buf_state   = list(self.buf_state)
+            buf_pose    = list(self.buf_pose)
+            buf_tick_ts = list(self.buf_tick_ts)
+            buf_dl      = list(self.buf_digit_l)
+            buf_dr      = list(self.buf_digit_r)
+            buf_dl_ts   = list(self.buf_digit_l_ts)
+            buf_dr_ts   = list(self.buf_digit_r_ts)
+
+        T20 = len(buf_state)
+        if T20 == 0:
             self.get_logger().warn("Buffer rỗng — chưa có frame nào!")
             return
 
-        T       = len(self.buf_state)
-        elapsed = time.time() - self.t_start
-        fps_real = T / max(elapsed, 0.001)
+        # Cảnh báo nếu thiếu DIGIT (đừng lưu rác)
+        T60_l = len(buf_dl)
+        T60_r = len(buf_dr)
+        if T60_l == 0 or T60_r == 0:
+            self.get_logger().warn(
+                f"⚠️  DIGIT trống (L={T60_l}, R={T60_r})! "
+                f"Kiểm tra digit_publisher. KHÔNG lưu demo này.")
+            self._reset_buffers()
+            return
 
-        arr_front   = np.stack(self.buf_front,   axis=0)
-        arr_wrist   = np.stack(self.buf_wrist,   axis=0)
-        arr_state   = np.stack(self.buf_state,   axis=0)
-        arr_action  = np.stack(self.buf_action,  axis=0)
-        arr_tactile = np.stack(self.buf_tactile, axis=0)
+        elapsed  = time.time() - self.t_start
+        fps_real = T20 / max(elapsed, 0.001)
+
+        # ── FORWARD DELTA: action[t] = pose(t+1) - pose(t) ──
+        # pose = [x,y,z, roll,pitch,yaw, gripper]. Frame cuối không có t+1 → lặp delta=0 cho gripper giữ.
+        poses = np.stack(buf_pose, axis=0)   # (T20, 7)
+        actions = np.zeros((T20, ACTION_DIM), dtype=np.float32)
+        for t in range(T20 - 1):
+            actions[t, 0:6] = poses[t+1, 0:6] - poses[t, 0:6]   # delta xyz+rpy (forward)
+            actions[t, 6]   = poses[t+1, 6]                      # gripper = lệnh kế tiếp
+        # Frame cuối: không có t+1 → delta xyz/rpy = 0, gripper giữ nguyên
+        actions[T20-1, 0:6] = 0.0
+        actions[T20-1, 6]   = poses[T20-1, 6]
+
+        arr_front   = np.stack(buf_front, axis=0)
+        arr_wrist   = np.stack(buf_wrist, axis=0)
+        arr_state   = np.stack(buf_state, axis=0)
+        arr_digit_l = np.stack(buf_dl, axis=0)        # (T60, 320, 240, 3)
+        arr_digit_r = np.stack(buf_dr, axis=0)
+        arr_dl_ts   = np.array(buf_dl_ts, dtype=np.float64)
+        arr_dr_ts   = np.array(buf_dr_ts, dtype=np.float64)
+        arr_tick_ts = np.array(buf_tick_ts, dtype=np.float64)
 
         demo_name = f"demo_{self.next_demo_id}"
         with h5py.File(self.h5_path, "a") as f:
+            if "data" not in f:
+                g = f.create_group("data")
+                g.attrs["task"]       = self.task
+                g.attrs["fps"]        = self.fps
+                g.attrs["digit_fps"]  = 60
+                g.attrs["state_dim"]  = STATE_DIM
+                g.attrs["action_dim"] = ACTION_DIM
+                g.attrs["image_shape"]= list(IMAGE_SHAPE)
+                g.attrs["digit_shape"]= list(DIGIT_SHAPE)
+                g.attrs["robot"]      = "UR3"
+                g.attrs["action_convention"] = "forward_delta: action[t]=pose(t+1)-pose(t)"
+                g.attrs["state_keys"] = "ee_x,ee_y,ee_z,qx,qy,qz,qw,gripper"
+                g.attrs["action_keys"]= "dx,dy,dz,d_roll,d_pitch,d_yaw,gripper"
             grp = f["data"].create_group(demo_name)
             obs = grp.create_group("obs")
-            obs.create_dataset("image",         data=arr_front,
+            # 20Hz
+            obs.create_dataset("image",       data=arr_front,
                                compression="gzip", compression_opts=4)
-            obs.create_dataset("wrist_image",   data=arr_wrist,
+            obs.create_dataset("wrist_image", data=arr_wrist,
                                compression="gzip", compression_opts=4)
-            obs.create_dataset("state",         data=arr_state)
-            obs.create_dataset("tactile_state", data=arr_tactile)
-            grp.create_dataset("actions",       data=arr_action)
+            obs.create_dataset("state",       data=arr_state)
+            obs.create_dataset("timestamp",   data=arr_tick_ts)
+            # 60Hz (dual-rate)
+            obs.create_dataset("digit_left",     data=arr_digit_l,
+                               compression="gzip", compression_opts=4)
+            obs.create_dataset("digit_right",    data=arr_digit_r,
+                               compression="gzip", compression_opts=4)
+            obs.create_dataset("digit_left_ts",  data=arr_dl_ts)
+            obs.create_dataset("digit_right_ts", data=arr_dr_ts)
+            # action 20Hz
+            grp.create_dataset("actions",     data=actions)
 
-            grp.attrs["success"]     = bool(success)
-            grp.attrs["n_frames"]    = T
-            grp.attrs["fps_actual"]  = float(fps_real)
-            grp.attrs["duration_s"]  = float(elapsed)
-            grp.attrs["task"]        = self.task
-            grp.attrs["recorded_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            grp.attrs["success"]      = bool(success)
+            grp.attrs["n_frames"]     = T20
+            grp.attrs["n_digit_l"]    = T60_l
+            grp.attrs["n_digit_r"]    = T60_r
+            grp.attrs["fps_actual"]   = float(fps_real)
+            grp.attrs["duration_s"]   = float(elapsed)
+            grp.attrs["task"]         = self.task
+            grp.attrs["recorded_at"]  = time.strftime("%Y-%m-%d %H:%M:%S")
 
         icon = "✅" if success else "❌"
         self.get_logger().info(
-            f"{icon} {demo_name}  {T}f  {fps_real:.1f}fps  {elapsed:.1f}s"
-            f"  state8  action7  → {self.h5_path}")
+            f"{icon} {demo_name}  20Hz={T20}f  60Hz=L{T60_l}/R{T60_r}  "
+            f"{fps_real:.1f}fps  {elapsed:.1f}s → {self.h5_path}")
 
-        # Reset buffers
-        self.buf_front = []; self.buf_wrist   = []
-        self.buf_state = []; self.buf_action  = []
-        self.buf_tactile = []
+        self._reset_buffers()
         self.next_demo_id += 1
         self.ep_total += 1
         if success:
             self.ep_success += 1
+
+    def _reset_buffers(self):
+        with self._lock:
+            self.buf_front      = []
+            self.buf_wrist      = []
+            self.buf_digit_l    = []
+            self.buf_digit_r    = []
+            self.buf_digit_l_ts = []
+            self.buf_digit_r_ts = []
+            self.buf_state      = []
+            self.buf_pose       = []
+            self.buf_tick_ts    = []
 
     # ──────────────────────────────────────────────────────
     # GUI
     # ──────────────────────────────────────────────────────
     def make_gui_frame(self):
         with self._lock:
-            f           = self.front_img.copy()  if self.front_img  is not None else None
-            w           = self.wrist_img.copy()  if self.wrist_img  is not None else None
+            f           = self.front_img.copy()   if self.front_img   is not None else None
+            w           = self.wrist_img.copy()   if self.wrist_img   is not None else None
+            dl          = self.digit_l_img.copy() if self.digit_l_img is not None else None
+            dr          = self.digit_r_img.copy() if self.digit_r_img is not None else None
             fc, wc      = self.front_count, self.wrist_count
+            dlc, drc    = self.digit_l_count, self.digit_r_count
             has_actual  = self.actual_pose  is not None
             has_target  = self.target_pose  is not None
             has_gripper = self.gripper      is not None
             grip_data   = dict(self.gripper) if self.gripper else None
             actual      = dict(self.actual_pose) if self.actual_pose else None
 
-        W, H = DISPLAY_SIZE
+        # Mỗi panel (4 cam → lưới 2x2, panel nhỏ hơn cho vừa màn hình)
+        PW, PH = 480, 270
 
         def panel(img, label, count):
             if img is not None:
-                p   = cv2.resize(img, (W, H))
+                p   = cv2.resize(img, (PW, PH))
                 col = (0, 220, 0)
                 txt = f"{label}  #{count}"
             else:
-                p   = np.zeros((H, W, 3), np.uint8)
+                p   = np.zeros((PH, PW, 3), np.uint8)
                 col = (0, 0, 220)
                 txt = f"{label}  NO DATA"
-                cv2.putText(p, "NO DATA", (W//2-100, H//2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, col, 3)
-            cv2.rectangle(p, (0, 0), (W-1, H-1), col, 4)
-            cv2.putText(p, txt, (12, 32),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, col, 2)
+                cv2.putText(p, "NO DATA", (PW//2-90, PH//2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, col, 2)
+            cv2.rectangle(p, (0, 0), (PW-1, PH-1), col, 3)
+            cv2.putText(p, txt, (10, 26),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, col, 2)
             return p
 
-        cams = np.hstack([panel(f, "FRONT", fc), panel(w, "WRIST", wc)])
+        # Lưới 2×2:
+        #   [ FRONT ] [ WRIST ]
+        #   [ DIGIT_L] [ DIGIT_R]
+        row_top = np.hstack([panel(f,  "FRONT",   fc),
+                             panel(w,  "WRIST",   wc)])
+        row_bot = np.hstack([panel(dl, "DIGIT_L", dlc),
+                             panel(dr, "DIGIT_R", drc)])
+        cams = np.vstack([row_top, row_bot])
 
-        bar = np.zeros((100, W*2, 3), np.uint8)
+        full_w = PW * 2
+
+        bar = np.zeros((100, full_w, 3), np.uint8)
 
         # Line 1: REC status
         if self.recording:
-            txt = (f"🔴 REC  demo_{self.next_demo_id}  "
+            txt = (f"REC  demo_{self.next_demo_id}  "
                    f"frame={self.frame_idx}  t={time.time()-self.t_start:.1f}s")
             col = (0, 0, 255)
         else:
-            txt = (f"⏸  IDLE  next=demo_{self.next_demo_id}  "
+            txt = (f"IDLE  next=demo_{self.next_demo_id}  "
                    f"ok={self.ep_success}/{self.ep_total}")
             col = (180, 180, 180)
         cv2.putText(bar, txt, (12, 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, col, 2)
 
-        # Line 2: Topic status
-        dot = lambda ok: "●" if ok else "○"
+        # Line 2: Topic status (gồm cả 2 DIGIT)
+        dot = lambda ok: "*" if ok else "-"
         info = (f"front {dot(f is not None)}#{fc}  "
                 f"wrist {dot(w is not None)}#{wc}  "
+                f"digL {dot(dl is not None)}#{dlc}  "
+                f"digR {dot(dr is not None)}#{drc}  "
                 f"actual {dot(has_actual)}  "
                 f"target {dot(has_target)}  "
                 f"grip {dot(has_gripper)}")
@@ -481,10 +635,13 @@ def main():
                 with node._lock:
                     has_front   = node.front_img  is not None
                     has_wrist   = node.wrist_img  is not None
+                    has_dl      = node.digit_l_img is not None
+                    has_dr      = node.digit_r_img is not None
                     has_actual  = node.actual_pose is not None
                     has_target  = node.target_pose is not None
                     has_grip    = node.gripper     is not None
                     fc, wc      = node.front_count, node.wrist_count
+                    dlc, drc    = node.digit_l_count, node.digit_r_count
 
                 dot = lambda ok: "●" if ok else "○"
                 if node.recording:
@@ -493,6 +650,8 @@ def main():
                          f"{node.frame_idx}f {elapsed:.1f}s  "
                          f"| front {dot(has_front)}#{fc} "
                          f"wrist {dot(has_wrist)}#{wc} "
+                         f"digL {dot(has_dl)}#{dlc} "
+                         f"digR {dot(has_dr)}#{drc} "
                          f"actual {dot(has_actual)} "
                          f"target {dot(has_target)} "
                          f"grip {dot(has_grip)}   ")
@@ -501,6 +660,8 @@ def main():
                          f"ok={node.ep_success}/{node.ep_total}  "
                          f"| front {dot(has_front)}#{fc} "
                          f"wrist {dot(has_wrist)}#{wc} "
+                         f"digL {dot(has_dl)}#{dlc} "
+                         f"digR {dot(has_dr)}#{drc} "
                          f"actual {dot(has_actual)} "
                          f"target {dot(has_target)} "
                          f"grip {dot(has_grip)}   ")
@@ -513,9 +674,10 @@ def main():
 
     # ── GUI cv2 thread ──
     def gui_loop():
-        win = "Record All — Front | Wrist"
+        win = "Record All — Front|Wrist + DIGIT L|R"
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(win, DISPLAY_SIZE[0]*2, DISPLAY_SIZE[1]+100)
+        # Lưới 2x2 panel 480x270 = 960x540, + 100 status bar
+        cv2.resizeWindow(win, 960, 640)
         while rclpy.ok():
             try:
                 frame = node.make_gui_frame()
@@ -550,8 +712,10 @@ def main():
             k = getch()
             if k == ' ':
                 if not node.recording:
+                    # Robot ON + record NGAY (origin đã chốt bằng Home tay ở T3)
+                    node.teleop_on()
                     node.start_episode()
-                    print(f"\n🔴 START demo_{node.next_demo_id - 1 if node.next_demo_id > 0 else 0}")
+                    print(f"\n🟢🔴 SPACE — robot ON + REC demo_{node.next_demo_id}")
                 else:
                     node.stop_recording()
                     print("\n⏹  Dừng — bấm S (success) hoặc F (fail)")
@@ -559,11 +723,19 @@ def main():
                 if node.recording:
                     node.stop_recording()
                 node.save_episode(success=True)
+                # Tự động: tắt teleop + về home
+                node.teleop_off()
+                node.go_home()
+                print("✅ Đã lưu SUCCESS → robot OFF + về home. Bấm SPACE cho demo tiếp.")
             elif k in ('f', 'F'):
                 if node.recording:
                     node.stop_recording()
                 node.save_episode(success=False)
+                node.teleop_off()
+                node.go_home()
+                print("❌ Đã lưu FAIL → robot OFF + về home. Bấm SPACE cho demo tiếp.")
             elif k in ('q', 'Q', '\x03', '\x1b'):
+                node.teleop_off()
                 print(f"\n👋 Thoát  success={node.ep_success}/{node.ep_total}")
                 break
     except KeyboardInterrupt:

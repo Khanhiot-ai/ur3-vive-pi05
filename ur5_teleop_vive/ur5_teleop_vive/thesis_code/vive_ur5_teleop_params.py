@@ -25,16 +25,51 @@ try:
 except ImportError:
     Xyzrpy = None  # Fallback if message not available
 
-# Keyboard Input for Relative Control
-from pynput import keyboard
+# Keyboard Input for Relative Control — dùng evdev (chạy được trên Wayland)
+# pynput không bắt được phím trên Wayland + map sai phím Home (KP7).
+# → đọc thẳng device bàn phím qua evdev, bắt cả KEY_HOME lẫn KEY_KP7.
+import threading as _threading
+try:
+    import evdev
+    from evdev import ecodes as _ecodes
+    HAS_EVDEV = True
+except Exception:
+    HAS_EVDEV = False
+
+# Mã phím Home: KEY_HOME (102) HOẶC KEY_KP7 (71 — numpad 7, Home khi NumLock off)
+_HOME_KEYCODES = set()
+if HAS_EVDEV:
+    _HOME_KEYCODES = {_ecodes.KEY_HOME, _ecodes.KEY_KP7}
+
+def _find_keyboard_device():
+    """Tìm device bàn phím thật (có nhiều phím chữ, không phải chuột)."""
+    if not HAS_EVDEV:
+        return None
+    best = None
+    for path in evdev.list_devices():
+        try:
+            d = evdev.InputDevice(path)
+            caps = d.capabilities()
+            keys = caps.get(_ecodes.EV_KEY, [])
+            # Bàn phím thật: có phím chữ A và Home/KP7, nhiều phím
+            if (_ecodes.KEY_A in keys and len(keys) > 80
+                    and (_ecodes.KEY_HOME in keys or _ecodes.KEY_KP7 in keys)):
+                # Ưu tiên "AT Translated" (bàn phím laptop) hơn chuột-kèm-phím
+                if "mouse" not in d.name.lower():
+                    return d
+                best = best or d
+        except Exception:
+            continue
+    return best
 
 # ============================================
 # Relative Control Class
 # ============================================
 class RelativeControlWithKeyboard:
     """
-    Relative Control với keyboard input:
-    - Home: Set origin (lấy vị trí gốc)
+    Relative Control:
+    - Home key (evdev): set origin — bắt KEY_HOME + KEY_KP7, chạy trên Wayland
+    - /set_origin (từ record_all): set origin trực tiếp (dự phòng)
     """
     def __init__(self, logger):
         self.logger = logger
@@ -48,34 +83,42 @@ class RelativeControlWithKeyboard:
         self.home_pressed = False
         self.last_home_state = False
         
-        # Start keyboard listener
-        self.listener = keyboard.Listener(
-            on_press=self._on_key_press,
-            on_release=self._on_key_release
-        )
-        self.listener.start()
-        
-        self.logger.info("🎮 Relative Control initialized")
-        self.logger.info("   Home: Set origin (press to capture)")
-    
+        # ── Đọc bàn phím qua evdev (Wayland-compatible) ──
+        self.listener = None
+        self._evdev_running = False
+        kbd = _find_keyboard_device()
+        if kbd is not None:
+            self._evdev_running = True
+            self._evdev_dev = kbd
+            t = _threading.Thread(target=self._evdev_loop, daemon=True)
+            t.start()
+            self.logger.info(f"🎮 Relative Control — đọc Home từ: {kbd.name}")
+            self.logger.info("   Bấm Home (hoặc numpad 7) để set origin")
+        else:
+            self.logger.warn("⚠️ Không tìm thấy bàn phím evdev — dùng /set_origin từ record_all")
+        self.logger.info("   /set_origin: set origin từ record_all (dự phòng)")
+
+    def _evdev_loop(self):
+        """Đọc phím từ evdev, bắt Home (KEY_HOME / KEY_KP7)."""
+        try:
+            for ev in self._evdev_dev.read_loop():
+                if not self._evdev_running:
+                    break
+                if ev.type == _ecodes.EV_KEY and ev.code in _HOME_KEYCODES:
+                    if ev.value == 1:      # nhấn xuống
+                        self.home_pressed = True
+                    elif ev.value == 0:    # nhả
+                        self.home_pressed = False
+        except Exception as e:
+            self.logger.warn(f"evdev loop lỗi: {e}")
+
     def _on_key_press(self, key):
-        """Callback khi nhấn phím"""
-        try:
-            # Home key
-            if key == keyboard.Key.home:
-                self.home_pressed = True
-        except AttributeError:
-            pass
-    
+        """(Giữ cho tương thích — không dùng với evdev)"""
+        pass
+
     def _on_key_release(self, key):
-        """Callback khi nhả phím"""
-        try:
-            # Home key
-            if key == keyboard.Key.home:
-                self.home_pressed = False
-        except AttributeError:
-            pass
-    
+        pass
+
     def update(self, tracker_pose_matrix, robot_current_pose, workspace_check=None):
         """
         Update mỗi frame
@@ -91,7 +134,7 @@ class RelativeControlWithKeyboard:
         # Phát hiện nhấn Home (edge detection)
         home_just_pressed = self.home_pressed and not self.last_home_state
         self.last_home_state = self.home_pressed
-        
+
         # Nếu nhấn Home → Set origin
         if home_just_pressed:
             target = self._set_origin(
@@ -159,7 +202,9 @@ class RelativeControlWithKeyboard:
     
     def shutdown(self):
         """Cleanup"""
-        self.listener.stop()
+        self._evdev_running = False
+        if self.listener is not None:
+            self.listener.stop()
 
 # -------------------------------------------------------
 
@@ -192,7 +237,8 @@ class ViveMarkerPub(Node):
             self.rel_control = RelativeControlWithKeyboard(self.get_logger())
             # Robot current pose (sẽ được cập nhật từ /ur_actual_pose)
             self.robot_current_pose = np.array([0.3, 0.2, 0.4])  # Giá trị khởi tạo
-            
+            self._latest_tracker_matrix = None   # matrix tracker mới nhất (cho /set_origin)
+
             # Subscribe actual pose từ Node 4
             if Xyzrpy is not None:
                 self.actual_pose_sub = self.create_subscription(
@@ -208,6 +254,13 @@ class ViveMarkerPub(Node):
             # Publisher cho lệnh di chuyển đến origin
             self.origin_cmd_pub = self.create_publisher(Pose, '/robot_origin_cmd', 10)
             self.get_logger().info("✅ Publisher /robot_origin_cmd created")
+
+            # ✅ [FIX Wayland] Subscriber /set_origin — set origin TRỰC TIẾP từ
+            #    tracker matrix mới nhất (KHÔNG cần pynput, chạy được trên Wayland)
+            from std_msgs.msg import Bool as _Bool
+            self.set_origin_sub = self.create_subscription(
+                _Bool, '/set_origin', self._set_origin_direct_cb, 10)
+            self.get_logger().info("✅ Subscribed to /set_origin (set origin trực tiếp, không cần Home tay)")
         else:
             self.rel_control = None
             self.robot_current_pose = None
@@ -463,6 +516,48 @@ class ViveMarkerPub(Node):
         if self.control_mode == 'relative':
             self.robot_current_pose = np.array([msg.x, msg.y, msg.z])
 
+    def _set_origin_direct_cb(self, msg):
+        """
+        [FIX Wayland] record_all gửi /set_origin=True → set origin NGAY từ
+        tracker matrix mới nhất. Không qua pynput/edge-detection nên chạy
+        được trên Wayland (bấm Home không cần nữa).
+        """
+        if not msg.data:
+            return
+        if self._latest_tracker_matrix is None:
+            self.get_logger().warn(
+                "⚠️ [/set_origin] Chưa có tracker pose! Tracker được track chưa?")
+            return
+
+        # Workspace check
+        ws_cfg = self.cfg['robot_ws']
+        ws_center = [float(ws_cfg['x_mid']), float(ws_cfg['y_mid']), float(ws_cfg['z_mid'])]
+        ws_len    = [float(ws_cfg['x_len']), float(ws_cfg['y_len']), float(ws_cfg['z_len'])]
+        def workspace_check(point):
+            return self.is_point_inside_cuboid(point, ws_center, ws_len)
+
+        # Set origin trực tiếp (gọi thẳng _set_origin, không qua update/edge)
+        target = self.rel_control._set_origin(
+            self._latest_tracker_matrix,
+            self.robot_current_pose,
+            workspace_check=workspace_check)
+
+        self.get_logger().info("🏠 [/set_origin] Origin set TRỰC TIẾP (không cần Home tay)")
+
+        # Nếu trong workspace → publish lệnh robot di chuyển đến tracker
+        if target is not None and workspace_check(target):
+            origin_cmd = Pose()
+            origin_cmd.position.x = float(target[0])
+            origin_cmd.position.y = float(target[1])
+            origin_cmd.position.z = float(target[2])
+            origin_cmd.orientation.x = 1.0
+            origin_cmd.orientation.y = 0.0
+            origin_cmd.orientation.z = 0.0
+            origin_cmd.orientation.w = 0.0
+            self.origin_cmd_pub.publish(origin_cmd)
+            self.robot_current_pose = target
+            self.get_logger().info(f"🤖 [ORIGIN CMD] Robot di chuyển đến: {target.round(3).tolist()}")
+
     def pose_to_matrix(self, pose):
         """Chuyển Pose → Matrix 4x4"""
         t = np.array([pose.position.x, pose.position.y, pose.position.z])
@@ -491,6 +586,9 @@ class ViveMarkerPub(Node):
             # Áp dụng World Alignment (nếu có)
             if self.use_world_alignment:
                 tracker_pose_matrix = self.world_alignment @ tracker_pose_matrix
+
+            # Lưu matrix mới nhất (cho /set_origin set trực tiếp, không cần pynput)
+            self._latest_tracker_matrix = tracker_pose_matrix
             
             # Tạo workspace check function
             ws_cfg = self.cfg['robot_ws']

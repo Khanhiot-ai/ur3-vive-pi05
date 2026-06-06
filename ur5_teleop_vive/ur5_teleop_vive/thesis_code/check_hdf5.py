@@ -150,12 +150,41 @@ def check_dataset(hdf5_path, show_demo=None, save_images=False):
         else:
             print(f"  {err('obs/wrist_image: MISSING')}")
 
-        # tactile_state
-        if "tactile_state" in obs:
-            arr = np.asarray(obs["tactile_state"])
-            print(f"  {ok(f'obs/tactile:     {arr.shape}  dtype={arr.dtype}')}")
+        # digit_left / digit_right (DIGIT tactile, dual-rate 60Hz)
+        n_img = np.asarray(obs["image"]).shape[0] if "image" in obs else 0
+        if "digit_left" in obs:
+            arr = np.asarray(obs["digit_left"])
+            print(f"  {ok(f'obs/digit_left:  {arr.shape}  dtype={arr.dtype}')}")
+            # Check dual-rate (T60 ≈ 3×T20)
+            if n_img > 0:
+                ratio = arr.shape[0] / n_img
+                if 2.5 <= ratio <= 3.5:
+                    print(f"       {ok(f'Dual-rate OK: {arr.shape[0]}/{n_img} = {ratio:.2f}× (~3, DIGIT 60Hz)')}")
+                else:
+                    print(f"       {warn(f'Tỉ lệ {ratio:.2f}× (mong đợi ~3 nếu DIGIT 60Hz)')}")
+            # Check portrait/landscape
+            h, w = arr.shape[1], arr.shape[2]
+            if (h, w) == (320, 240):
+                print(f"       {ok('Portrait (320,240) — đúng cho V-JEPA')}")
+            elif (h, w) == (240, 320):
+                print(f"       {warn('Landscape (240,320) — chưa xoay portrait!')}")
+            else:
+                print(f"       shape (H={h}, W={w})")
         else:
-            print(f"  {warn('obs/tactile_state: không có (OK nếu không dùng)')}")
+            print(f"  {warn('obs/digit_left: không có')}")
+        if "digit_right" in obs:
+            arr = np.asarray(obs["digit_right"])
+            print(f"  {ok(f'obs/digit_right: {arr.shape}  dtype={arr.dtype}')}")
+        else:
+            print(f"  {warn('obs/digit_right: không có')}")
+
+        # Timestamp dual-rate
+        if "digit_left_ts" in obs and "timestamp" in obs:
+            dts = np.asarray(obs["digit_left_ts"])
+            tts = np.asarray(obs["timestamp"])
+            print(f"  {ok(f'timestamp: digit={dts.shape[0]} (60Hz), tick={tts.shape[0]} (20Hz)')}")
+        elif "digit_left" in obs:
+            print(f"  {warn('Thiếu timestamp (digit_left_ts/timestamp) — converter không align được dual-rate')}")
 
         # ── Check action sanity (schema berkeley: 7 dim delta) ──
         print(f"\n{BOLD}── Action sanity check ──────────────────────{RESET}")

@@ -138,6 +138,8 @@ def convert(args):
         task_list    = [{"task_index": 0, "task": task_str}]
 
         frame_global = 0  # frame index toàn dataset
+        dataset_has_digit = False   # cờ: dataset này có DIGIT không
+        digit_h, digit_w = 320, 240  # portrait default (cập nhật khi đọc frame thật)
 
         for ep_idx, demo_name in enumerate(demo_names):
             grp     = demos[demo_name]
@@ -154,10 +156,31 @@ def convert(args):
             print(f"  {'✅' if success else '❌'} {demo_name}  {n_frames}f", end="")
 
             # ── Lấy arrays ──
-            state_arr   = np.asarray(obs["state"],   dtype=np.float32)   # (T, 8): ee_xyz+quat+grip
-            action_arr  = np.asarray(actions,        dtype=np.float32)   # (T, 7): delta_xyz+rpy+grip
-            image_arr   = np.asarray(obs["image"])                       # (T,H,W,3)
-            wrist_arr   = np.asarray(obs["wrist_image"])                 # (T,H,W,3)
+            state_arr   = np.asarray(obs["state"],   dtype=np.float32)   # (T20, 8)
+            action_arr  = np.asarray(actions,        dtype=np.float32)   # (T20, 7)
+            image_arr   = np.asarray(obs["image"])                       # (T20,H,W,3)
+            wrist_arr   = np.asarray(obs["wrist_image"])                 # (T20,H,W,3)
+
+            # ── DIGIT dual-rate: map 60Hz → grid 20Hz theo timestamp ──
+            has_digit = ("digit_left" in obs and "digit_right" in obs
+                         and "digit_left_ts" in obs and "timestamp" in obs)
+            digit_l_grid = None
+            digit_r_grid = None
+            if has_digit:
+                dataset_has_digit = True
+                dl_arr  = np.asarray(obs["digit_left"])      # (T60, Hd, Wd, 3)
+                dr_arr  = np.asarray(obs["digit_right"])
+                digit_h, digit_w = dl_arr.shape[1], dl_arr.shape[2]   # shape thật
+                dl_ts   = np.asarray(obs["digit_left_ts"])   # (T60,)
+                dr_ts   = np.asarray(obs["digit_right_ts"])
+                tick_ts = np.asarray(obs["timestamp"])       # (T20,)
+                # Với mỗi tick 20Hz, tìm DIGIT frame có ts gần nhất (≤ tick)
+                def nearest_idx(ts_arr, t_query):
+                    return int(np.argmin(np.abs(ts_arr - t_query)))
+                digit_l_grid = [dl_arr[nearest_idx(dl_ts, tick_ts[t])]
+                                for t in range(len(tick_ts))]
+                digit_r_grid = [dr_arr[nearest_idx(dr_ts, tick_ts[t])]
+                                for t in range(len(tick_ts))]
 
             T = min(n_frames, len(state_arr))
 
@@ -183,6 +206,18 @@ def convert(args):
             write_video(front_frames, front_mp4, fps=fps)
             write_video(wrist_frames, wrist_mp4, fps=fps)
 
+            # ── Write DIGIT videos (đã map về grid 20Hz) ──
+            if has_digit:
+                digit_l_mp4 = str(out_path / "videos" / "chunk-000" /
+                                  f"observation.digit_left_{ep_str}.mp4")
+                digit_r_mp4 = str(out_path / "videos" / "chunk-000" /
+                                  f"observation.digit_right_{ep_str}.mp4")
+                # Lấy đúng T frame
+                dl_frames = [digit_l_grid[t] for t in range(T)]
+                dr_frames = [digit_r_grid[t] for t in range(T)]
+                write_video(dl_frames, digit_l_mp4, fps=fps)
+                write_video(dr_frames, digit_r_mp4, fps=fps)
+
             # ── Build Parquet rows ──
             rows = []
             for t in range(T):
@@ -200,6 +235,9 @@ def convert(args):
                     "observation.image": f"videos/chunk-000/observation.image_{ep_str}.mp4",
                     "observation.wrist_image": f"videos/chunk-000/observation.wrist_image_{ep_str}.mp4",
                 }
+                if has_digit:
+                    row["observation.digit_left"]  = f"videos/chunk-000/observation.digit_left_{ep_str}.mp4"
+                    row["observation.digit_right"] = f"videos/chunk-000/observation.digit_right_{ep_str}.mp4"
                 rows.append(row)
 
             df = pd.DataFrame(rows)
@@ -306,6 +344,23 @@ def convert(args):
     }
 
     # ── Ghi meta files ──
+    # ── Thêm DIGIT features nếu dataset có ──
+    if dataset_has_digit:
+        digit_feat = {
+            "dtype": "video",
+            "shape": [digit_h, digit_w, 3],
+            "names": ["height", "width", "channels"],
+            "video_info": {
+                "video.fps": fps,
+                "video.codec": "mp4v",
+                "video.pix_fmt": "yuv420p",
+                "video.is_depth_map": False,
+                "has_audio": False,
+            },
+        }
+        info["features"]["observation.digit_left"]  = dict(digit_feat)
+        info["features"]["observation.digit_right"] = dict(digit_feat)
+
     with open(out_path / "meta" / "info.json", "w") as f:
         json.dump(info, f, indent=2)
 

@@ -1,21 +1,9 @@
-# Python
-__pycache__/
-*.pyc
-*.pyo
-
-# Dataset (file lớn, không push)
 dataset/
+*.hdf5
 *.mp4
-*.jpg
-*.png
-
-# Build artifacts
+*.parquet
 build/
 install/
 log/
-
-# IDE
-.vscode/
-.idea/
-ur_log/
-*.log
+__pycache__/
+*.pyc

@@ -107,15 +107,28 @@ class ViveTrackerNode(Node):
         
         # Joy Publisher (simulating right controller)
         self.joy_pub = self.create_publisher(Joy, '/vive_right', 10)
-        
+
+        # ✅ [NEW] Subscriber /teleop_enable — record_all điều khiển ON/OFF tự động
+        from std_msgs.msg import Bool as _Bool
+        self.enable_sub = self.create_subscription(
+            _Bool, '/teleop_enable', self._enable_cb, 10
+        )
+
         # Timer for main loop (90 Hz)
         self.timer = self.create_timer(1.0 / 90.0, self.timer_callback)
-        
+
         self.get_logger().info('Vive Tracker Node Started!')
-        self.get_logger().info('--> TAP [Ctrl_R] TO TOGGLE TRIGGER ON/OFF')
+        self.get_logger().info('--> TAP [Ctrl_R] hoặc /teleop_enable để TOGGLE')
         self.get_logger().info('    🟢 ON  = Robot bám tracker')
         self.get_logger().info('    🔴 OFF = Robot đứng yên')
         self.get_logger().info(f'--> Tracker ID {tracker_id} published as "right_controller"')
+
+    def _enable_cb(self, msg):
+        """record_all gửi True (SPACE) / False (S) để bật/tắt teleop."""
+        global is_space_pressed
+        is_space_pressed = bool(msg.data)
+        state = "ON 🟢" if is_space_pressed else "OFF 🔴"
+        self.get_logger().info(f"[/teleop_enable] Trigger {state}")
 
     def timer_callback(self):
         global is_space_pressed

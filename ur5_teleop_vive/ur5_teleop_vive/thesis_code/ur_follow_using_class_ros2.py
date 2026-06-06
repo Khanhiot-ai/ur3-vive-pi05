@@ -165,6 +165,17 @@ class URFollowVive(Node):
             10
         )
         self.get_logger().info("✅ Subscribed to /robot_origin_cmd")
+
+        # ✅ [NEW] Subscriber /auto_home — record_all gửi khi bấm S
+        from std_msgs.msg import Bool as _Bool
+        self.auto_home_sub = self.create_subscription(
+            _Bool,
+            '/auto_home',
+            self.auto_home_callback,
+            10
+        )
+        self.get_logger().info("✅ Subscribed to /auto_home")
+        self.is_going_home = False
         
         # ✅ [NEW] Flag để track origin movement
         self.is_moving_to_origin = False
@@ -300,6 +311,31 @@ class URFollowVive(Node):
             self.get_logger().error(f"❌ Origin movement failed: {e}")
             self.is_moving_to_origin = False
 
+    def auto_home_callback(self, msg):
+        """Nhận lệnh về HOME từ record_all (khi bấm S)."""
+        if not msg.data:
+            return
+        if self.is_going_home:
+            return
+        self.is_going_home = True
+        self.get_logger().info("🏠 [AUTO HOME] Đưa robot về home position...")
+        try:
+            # Dừng servo realtime trước khi moveJ
+            self.rtde_c.servoStop()
+            time.sleep(0.1)
+            # moveJ về home joint config
+            self.rtde_c.moveJ(
+                self.robot_startposition,
+                self.VELOCITY,
+                self.ACCELERATION
+            )
+            time.sleep(0.2)
+            self.get_logger().info("✅ Đã về home!")
+        except Exception as e:
+            self.get_logger().error(f"❌ Auto home failed: {e}")
+        finally:
+            self.is_going_home = False
+
     def publish_ee_pose_msg(self, current_pose):
         self.ee_pose_msg.header.stamp = self.get_clock().now().to_msg()
         self.ee_pose_msg.x = float(current_pose[0])
@@ -326,6 +362,10 @@ class URFollowVive(Node):
         
         # ✅ [NEW] Nếu đang di chuyển đến origin → Skip control loop
         if self.is_moving_to_origin:
+            return
+
+        # ✅ [NEW] Nếu đang về home → Skip control loop
+        if self.is_going_home:
             return
         
         # --- DEBUG 1: KIỂM TRA DỮ LIỆU ĐẦU VÀO ---
