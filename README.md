@@ -2,7 +2,7 @@
 
 > **Hướng dẫn đầy đủ A→Z** để dựng lại dự án từ đầu. Đọc tuần tự từ mục 1.
 
-Hệ thống teleoperation: điều khiển robot **UR3** bằng **HTC Vive Tracker**, gripper **Robstride**, 2 camera **RealSense** + 2 cảm biến xúc giác **DIGIT v1**, thu dataset HDF5 đa-modal để fine-tune **Pi0.5 VLA** cho task gắp bánh răng thả vào cột.
+Hệ thống teleoperation: điều khiển robot **UR3** bằng **HTC Vive Tracker**, gripper **Robstride-05**, 2 camera **RealSense** + 2 cảm biến xúc giác **DIGIT v1**, thu dataset HDF5 đa-modal để fine-tune **Pi0.5 VLA** cho task gắp bánh răng thả vào cột.
 
 🔗 **Repo:** https://github.com/Khanhiot-ai/ur3-vive-pi05
 📦 **Dataset:** https://huggingface.co/datasets/qkhanh1/ur3_pick_cube
@@ -159,6 +159,9 @@ ls /dev/ttyACM*                                  # CANable2 có
 ## 6. Setup phần cứng từng bước
 
 ### 6.1 CAN cho gripper (CANable2 / slcand)
+
+
+
 
 ```bash
 # Tạo script setup CAN
@@ -387,6 +390,16 @@ python3 ur_follow_using_class_ros2.py
 
 ```bash
 # T6 — Gripper Robstride
+# Tìm port
+ls /dev/ttyACM*
+# Thường là /dev/ttyACM0
+# Bring up CAN interface
+sudo slcand -o -c -s8 /dev/ttyACM0 can0
+sudo ip link set can0 up
+sudo ip link set can0 txqueuelen 1000
+# Kiểm tra
+ip link show can0
+# Phải thấy: state UP và chi tiết cách chạy từng file , từng giai đoạn như trước và fix lỗi
 python3.10 control_robstride_ros_without_calip.py --channel can0
 # Gõ: c → m → o (mở hết) → p (kẹp hết)
 
